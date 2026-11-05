@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.DS_Store
+
+# Herdr generates these API/editor files; retain authored mod assets.
+**/gpui-kit.d.ts
+**/herdr.d.ts
+**/jsconfig.json
+
+# Reproducible installation package (scripts/install.py --prepare integration).
+/integration/
+
+# Local review state, scratch evidence and runtime artifacts.
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.state/
+.artifacts/
+artifacts/
+.tmp/

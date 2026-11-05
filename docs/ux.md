@@ -1,0 +1,54 @@
+# Review surface
+
+**Mode: Operate.** Extend the established Herdr interface. Do not introduce a web-style visual identity. Visual authority: shipped `tabs`, `changes`, `workspace-chrome` and theme tokens; a baseline screenshot was captured and inspected during research.
+
+## Structure
+
+- Review opens as a Herdr pane right of the focused pane (`mod.open Codewalker`, bound to a key, or `backend.py open`). No tab-bar copy and no custom layout: they don't get Herdr's updates and don't compose with other mods.
+- As a pane, Review shows the folder of the pane it opened beside, and Herdr draws its frame and header. Without a folder (the focused pane had none), it shows the focused terminal's folder, else the active space's folder (never its name), and follows focus; a draft is saved before it follows. The folder button (icon only) reviews another checkout.
+- Responsive: below 760 px the changed-path list sits above the diff, at most about a third of the height; wider, the two sit side by side. Below 560 px line-number columns narrow and discussion cards lose their gutter inset. Header and scope bar drop secondary labels before they truncate the checkout.
+- Source strip: Uncommitted, Branch, explicit local base ref, resolved comparison label, Refresh.
+- **Discussions** view, toggled by the 💬 header button between Refresh and the folder button (it shows the open count): all threads by file (diff order, then paths no longer in the diff), by line. Each shows anchor, status, up to three snippet lines, the first comment, and replies indented on a left rule. Resolved threads fold. **Show in diff** cannot scroll the native diff (only virtual lists scroll from code, and the diff holds inline editors), so the diff starts at the thread's hunk, with Previous to see earlier rows, and the card has an accent border. A thread whose code changed is listed first in that file instead.
+- **Send to agent** view (header **Send n**, last after the folder button, shown while there are new or unclear comments; it toggles the view): agents in the active space, this checkout's first, each with Ready / Working / Needs you; an optional note; the exact message, with its size (a warning above 8 KB); Send. The default target is the focused agent, else the only one in this checkout; with several and none focused, the person picks. Send is enabled only for a Ready agent and uses `hc send --if idle`, never `--force`. A delivery record is durable before anything is typed; refusals (hc exit 3, 7, 9, 10, 11) clear it, anything else leaves it unclear with **It arrived** and **I checked · Send again**. Mods have no clipboard API, so there is no Copy button.
+- Changed-path navigator, not a directory tree. Separate retained-discussion and saved-draft entries are recovery paths, not browsing modes.
+- Unified old/new diff gutters. Inline human/agent messages and a multiline composer beneath the selected line/thread. Stale conversations retain original snippet and status; resolution never removes messages.
+- Page long diffs at 240 native rows. Ordinary rows permit real inline buttons and text input; deferred virtual-list callbacks cannot own those handlers in the installed runtime.
+
+## Styling and interaction
+
+Like Changes, every region sits on `background` and borders separate them; hunk headers use `raised`, discussion cards `surface`. Use Herdr's semantic background/surface, border, selected, muted and foreground colors. ANSI red/green identify removals/additions; accent identifies focus and agent attribution, not decoration. Match the 26px tab-toolbar control (22px inside cards); every labelled button has a 1px border, only icon-only buttons (close, dismiss) are bare and compact 12–13px UI type. Icons are stock Lucide (ISC, notice in `mods/Codewalker/icons/LICENSE`), written by `scripts/lucide_icons.py` from a local lucide-react package without running it, and tinted by text color. Reply, Edit and Delete carry reply, pencil and trash icons. File status letters: A green, D red, M yellow; red never means "modified". Code uses the configured mono family. Keep spacing, corners and borders consistent with existing controls.
+
+Old and new line numbers are explicit comment targets. Hovering a row tints it and shows an accent **+** comment button (new side, else old). Pressing a number or the **+** and dragging selects a range on that side; the range stops at the hunk where it started, so it cannot span missing context. The dragged range and an open comment's lines use the accent tint. Shift-click extends an open range. Esc cancels a drag, then closes the composer (the draft is kept); **Discard** deletes it. Resolved discussions fold to one line. A thread's actions sit in one row under its messages, in the diff card and the Discussions list: Reply, then Edit and Delete for your first comment. Resolve / Reopen sits at the right of the thread's header in both views, so it is in the same place whether the thread is open, folded or long. Your later replies carry their own Edit and Delete. Your own messages have **Edit**: the body becomes an editor with Cancel and Save, one edit at a time; an edited message says so. **Delete** asks inline (Keep / red Delete); on the first comment it names the thread, because the thread and its replies go with it. Esc keeps the message. **Ask for a short reply** is a checkbox on every composer; the last choice is the default for the next comment in the session. A thread owed a reply shows **Awaiting reply** (working color) until any later message or resolution, and the status bar counts them. Line selection must not be inferred from a display-row number. Source/root navigation waits for durable draft save and refuses if newer text arrived during that save. Native input is disabled during a pending post; an uncertain post gets an explicit exact-command retry. Refresh never clears or substitutes editor text.
+
+## Responsiveness
+
+Modeled on Herdr's Changes sidebar: one cheap read, folder watches, and continuity over spinners.
+
+- One helper read returns the file list, all discussions, drafts and one file's hunks. Opening uses `--select-first`; there is no second request for the first diff or drafts.
+- The helper reads every old blob through one streaming `git cat-file --batch-command` process, one bounded object at a time. Peak memory and the aggregate budget do not change.
+- Refresh follows `watchFolder` on the checkout and on the discussion store folder, debounced to 500 ms. Git object/log writes and our own draft saves (1.5 s) are ignored; a post or resolve rereads explicitly. A 15-second timer covers missed events. Background refresh never changes the Refresh label or clears content.
+- At most one read runs; a newer request replaces the queued one. Reads do not wait behind draft saves or posts.
+- Diffs already read for the current snapshot reopen at once (24 files / 60,000 rows max). A new snapshot clears that cache.
+- When a file is not cached, the selection moves at once, a native spinner shows in the diff header, and the previous diff stays visible at 45% opacity until the new diff arrives. Its gutters are inert, so a dimmed row cannot be anchored.
+- A new anchor uses the snapshot of the rows the person saw, not the latest list snapshot. The helper rejects it if the code changed.
+
+Remaining cold cost on a 55-path checkout is ~0.27 s per read: ~40 ms interpreter start, ~70 ms repository identity, ~100 ms for six Git processes and hashing every changed file for `snapshotId` and anchor validity. That hashing is the safety evidence for anchors, so it is not skipped.
+
+## Full-height content regression
+
+The main content row must stretch both columns. `gpui-base`'s `h_flex()` centers children vertically by default; an auto-height column containing a header and a flexible scroll region can therefore collapse the scroll region to zero height. This hid both the changed-path list and diff even after the helper loaded all 55 paths of a real checkout. It also hid loading and empty-state content. The fix is `items_stretch()` on the content row, not a helper or overlay-size change.
+
+Run `python3 scripts/check-ui.py` after UI changes. It checks the native populated description's full-height column contract in addition to eager materialization. The guard fails on the original centered row; it does not measure geometry or paint. A passing check must still be followed by opening Review, capturing `herdr-app shot`, and inspecting actual changed paths and diff hunks—not only the toolbar or a loaded count.
+
+Post-fix live evidence: a screenshot was captured and inspected at 3840×2098 physical pixels. The supported `mod.open Codewalker` dialog showed a checkout's 55 changed paths, selected `AGENTS.md`, and its two real red/green hunks with old/new gutters. A matching pre-fix capture showed the blank body. The toolbar's nonmodal-window activation, resizing, scrolling and discussion interactions were not exercised by that command-path capture.
+
+## Manual verification after authorized installation
+
+Initial/eager native checks and synthetic populated-state checks are automated; these checks do **not** verify paint or interaction. The following remains human-driven:
+
+1. At normal and narrow desktop widths, inspect Review placement, root visibility, diff/readability, scrollbar behavior, inline composer overflow and light/dark theme contrast. Capture with `herdr-app shot` and inspect the image.
+2. Open Review beside a terminal in a misleadingly named space: verify it shows that terminal's checkout, then change terminal focus and confirm root does not change. A remote space must show an error, not local data.
+3. Click new/old/deleted-side lines, Shift-click a range, type multiline text, navigate/refresh while typing, close/reopen and restore a draft. Verify native keyboard focus and submit shortcut on the installed OS; test code/text selection separately from line-gutter activation.
+4. Post as human, reply through the documented agent CLI, refresh, resolve/reopen. Confirm authors, bodies, original location and history survive a changed file leaving the diff.
+5. Exercise missing base, nonrepository, helper failure, binary/oversized/unsupported files, external revision conflict and saved uncertain-post recovery. No error may erase an unsaved editor buffer or silently post a new duplicate command.
+6. Close the Review pane (the same key). Layout, settings/keys symlinks and durable review data must remain intact.

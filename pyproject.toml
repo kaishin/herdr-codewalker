@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-codewalker"
+version = "0.1.0"
+description = "Native Herdr change review and durable local annotations"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+codewalker = "backend.codewalker:main"
+
+[tool.setuptools]
+packages = ["backend"]
+
+# No installation required:
+# python3 -m unittest discover -s tests -p 'test_*.py' -v
