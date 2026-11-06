@@ -128,6 +128,12 @@ PY
 
 Export is nonconsuming; it never clears notes or sends/submits agent input.
 
+## Viewed-file checklist
+
+`review` returns `files[].viewed` and `files[].diffFingerprint`, plus the selected `file.diffFingerprint`. Marks are the reviewer's local checklist; do not change them unless asked. A read never marks a file.
+
+When asked, use `file-view` with the common mutation envelope and `{scope, base, path, diffFingerprint, viewed:true}` (or `false` to unmark). Take the fingerprint from the diff you actually inspected, not a newer summary. The backend checks it again; a changed file fails with `snapshot_conflict`. An unrelated changed file does not invalidate your evidence. A null fingerprint cannot be marked. Keep the exact request for retries, as with discussions. Marks and discussions share one revision, so refresh after either changes. There is no GitHub sync yet.
+
 ## Feedback the reviewer sends you
 
 **Send** in Review pastes a message into your terminal: one `###` section per discussion with its path, lines, thread ID, code and messages, then one command: `python3 <helper> skill --repo <checkout>`. It prints how to answer in a thread (rules and a reply/edit/delete recipe, with the paths filled in). `skill` needs no review and returns Markdown, not JSON. Act on the comments. Answer in the thread when it says `short reply requested` (a few sentences), then continue. The reviewer's later sends contain only new comments.

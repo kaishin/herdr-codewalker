@@ -668,3 +668,81 @@ test("only new comments in open threads are sent, also where the code changed; a
   // Line breaks typed in a comment stay breaks in Markdown; fenced code is untouched.
   assert.equal(model.markdownBody("a\nb\n\n- x\n- y\n```\ncode\nmore\n```\nend"), "a  \nb\n\n- x  \n- y\n```\ncode\nmore\n```\nend");
 });
+
+test("viewed marks target the displayed fingerprint, not a pending or newer file", async () => {
+  const gate = deferred(), calls = [];
+  const { view, cx, drain } = await modules({ client: {
+    setFileViewed: (...args) => { calls.push(args); return gate.promise; },
+  } });
+  view.files = [{ path: "a.txt", diffFingerprint: "diff-a", viewed: false }, { path: "b.txt", diffFingerprint: "diff-b", viewed: false }];
+  view.rowsFingerprint = "old-diff-a";
+  view.setViewed(true, cx);
+  view.rowsFingerprint = "diff-a";
+  view.pendingFile = "b.txt";
+  view.setViewed(true, cx);
+  await settle();
+  assert.equal(calls.length, 0, "stale or dimmed rows cannot mark a newer diff viewed");
+  view.pendingFile = null;
+  view.setViewed(true, cx);
+  view.setViewed(true, cx);
+  await settle();
+  assert.equal(calls.length, 1, "a pending write prevents duplicate activation");
+  assert.deepEqual(calls[0].slice(1), ["a.txt", "diff-a", true]);
+  assert.equal(view.files[0].viewed, false, "not marked before the save succeeds");
+  view.show("b.txt", { rows: [], diffFingerprint: "diff-b" });
+  view.refresh = () => {};
+  gate.resolve({ reviewId: "review-a", revision: 2 });
+  await drain();
+  assert.equal(view.files[0].viewed, true);
+  assert.equal(view.files[1].viewed, false, "finishing a save after navigation does not mark the selected file");
+  assert.equal(view.composer.value(), "Human question", "marking never navigates or clears a draft");
+});
+
+test("failed or superseded viewed writes cannot overwrite the current checklist", async () => {
+  const gate = deferred();
+  const { view, cx, drain } = await modules({ client: { setFileViewed: () => gate.promise } });
+  view.files = [{ path: "a.txt", diffFingerprint: "diff-a", viewed: false }];
+  view.rowsFingerprint = "diff-a";
+  view.setViewed(true, cx);
+  gate.reject(new Error("response lost"));
+  await drain();
+  assert.equal(view.files[0].viewed, false);
+  assert.match(view.error, /Refresh to check/);
+  assert.equal(view.viewing, null);
+
+  const newer = deferred();
+  view.client.setFileViewed = () => newer.promise;
+  view.setViewed(true, cx);
+  await settle();
+  view.revision = 4; // Another reader has already applied a later unview.
+  view.refresh = () => {};
+  newer.resolve({ reviewId: "review-a", revision: 2 });
+  await drain();
+  assert.equal(view.files[0].viewed, false);
+
+  const elsewhere = deferred();
+  view.client.setFileViewed = () => elsewhere.promise;
+  view.setViewed(true, cx);
+  await settle();
+  view.resetContext();
+  view.files = [{ path: "a.txt", diffFingerprint: "diff-a", viewed: false }];
+  elsewhere.resolve({ reviewId: "review-a", revision: 5 });
+  await drain();
+  assert.equal(view.files[0].viewed, false, "an old checkout's save cannot update a new checkout");
+});
+
+test("hide viewed is reversible, preserves selection and reveals changed files on refresh", async () => {
+  const { view, cx } = await modules();
+  view.hideViewed = true;
+  view.files = [{ path: "a.txt", diffFingerprint: "diff-a", viewed: true }, { path: "b.txt", viewed: false }];
+  assert.equal(view.visibleFiles().map(file => file.path).join(), "b.txt");
+  assert.equal(view.file, "a.txt", "hiding a selected file does not force navigation");
+  view.hideViewed = false;
+  assert.equal(view.visibleFiles().length, 2);
+  view.hideViewed = true;
+  view.apply({ ...review(), files: [{ path: "a.txt", diffFingerprint: "diff-new", viewed: false }],
+    detail: { path: "a.txt", diffFingerprint: "diff-new", rows: [] } }, {}, cx);
+  assert.equal(view.visibleFiles()[0].path, "a.txt");
+  assert.equal(view.rowsFingerprint, "diff-new");
+  assert.equal(view.composer.value(), "Human question");
+});

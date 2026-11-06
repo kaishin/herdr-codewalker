@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { props, spaces, panes, focused, agents, hc, run, notify, appHome, home, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
+import { props, spaces, panes, focused, agents, hc, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
 import { ReviewClient, HUMAN } from "./client.js";
 import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, sendText, utf8Bytes, markdownBody } from "./model.js";
 
@@ -120,6 +120,8 @@ export default class Codewalker extends View {
     this.file = null;
     this.pendingFile = null;
     this.rowsSnapshot = null;
+    this.rowsFingerprint = null;
+    this.viewing = null;
     this.cache = new Map();
     this.reading = false;
     this.queued = null;
@@ -131,6 +133,7 @@ export default class Codewalker extends View {
     // "files": changed files and a diff. "discussions": every thread, by file.
     this.mode = "files";
     this.filter = "all";
+    this.hideViewed = false;
     // Show in diff: the row the diff starts at, the thread to place, the card to mark.
     this.from = null;
     this.jumpTo = null;
@@ -281,7 +284,7 @@ export default class Codewalker extends View {
     this.watch(cx, review.root, review.storePath);
     const wanted = this.pendingFile ?? this.file ?? review.detail?.path ?? this.files[0]?.path ?? this.threads[0]?.path ?? null;
     if (!wanted) {
-      this.file = this.pendingFile = this.rowsSnapshot = null;
+      this.file = this.pendingFile = this.rowsSnapshot = this.rowsFingerprint = null;
       this.rows = [];
       this.fileNote = null;
       return true;
@@ -303,6 +306,7 @@ export default class Codewalker extends View {
     this.fileNote = detail.note;
     // Anchors use the snapshot of the rows the person saw, so a changed diff is rejected.
     this.rowsSnapshot = this.snapshotId;
+    this.rowsFingerprint = detail.diffFingerprint ?? null;
   }
 
   remember(detail) {
@@ -355,6 +359,57 @@ export default class Codewalker extends View {
 
   wrote(result) {
     if (result?.reviewId === this.reviewId && Number.isInteger(result.revision)) this.revision = Math.max(this.revision ?? 0, result.revision);
+  }
+
+  // Mark only the diff actually displayed, never the newer list's fingerprint
+  // while a file read is pending. No optimistic mark: a failed save stays unseen.
+  setViewed(viewed, cx) {
+    const file = this.files.find(file => file.path === this.file);
+    if (!file || !this.rowsFingerprint || file.diffFingerprint !== this.rowsFingerprint
+        || this.pendingFile || this.viewing || this.saving || this.leaving || this.postAttempt) return;
+    const context = this.context(), version = this.contextVersion;
+    const attempt = { path: file.path, fingerprint: this.rowsFingerprint, viewed };
+    this.viewing = attempt;
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const result = await this.client.setFileViewed(context, attempt.path, attempt.fingerprint, viewed);
+        if (version !== this.contextVersion || context.reviewId !== this.reviewId) return;
+        // Another writer's newer read may already have undone this mark.
+        if (result.revision >= this.revision) {
+          this.files = this.files.map(file => file.path === attempt.path && file.diffFingerprint === attempt.fingerprint
+            ? { ...file, viewed } : file);
+        }
+        this.wrote(result);
+        this.refresh(cx, true);
+      } catch (error) {
+        if (version === this.contextVersion) this.error = `Could not save viewed state. Refresh to check it before retrying. ${readableError(error)}`;
+      } finally {
+        if (this.viewing === attempt) this.viewing = null;
+        cx.notify();
+      }
+    });
+  }
+
+  visibleFiles() {
+    return this.hideViewed ? this.files.filter(file => !file.viewed) : this.files;
+  }
+
+  viewedBox(file) {
+    const t = theme(), checked = file.viewed === true;
+    const enabled = Boolean(this.rowsFingerprint) && file.diffFingerprint === this.rowsFingerprint
+      && !this.pendingFile && !this.viewing && !this.saving && !this.leaving && !this.postAttempt;
+    const hint = !file.diffFingerprint ? "This change has no reliable content fingerprint"
+      : "Mark this version of the file as viewed; new changes clear the mark";
+    return div().id("viewed-tip").flex_none().tooltip(hint).child(Checkbox.new("file-viewed").checked(checked).disabled(!enabled)
+      .accessibility_label(`Viewed ${file.path}`)
+      .when(enabled, el => el.cursor_pointer())
+      .on_mouse_down("left", stop).on_change((value, cx) => this.setViewed(value, cx))
+      .child(h_flex().gap(6).items_center().text_size(11).text_color(enabled ? t.foreground : t.dim)
+        .child(div().size(14).flex_none().flex().items_center().justify_center().rounded(4).border_1()
+          .border_color(checked ? t.accent : t.border).bg(checked ? t.accent : t.background)
+          .when(checked, el => el.child(svg(ICON.check).size(11).text_color(t.accent_foreground))))
+        .child(this.viewing?.path === file.path ? "Saving…" : "Viewed")));
   }
 
   // The docked panel shows the focused terminal's checkout, like Changes. A
@@ -419,6 +474,8 @@ export default class Codewalker extends View {
     this.cache.clear();
     this.pendingFile = null;
     this.rowsSnapshot = null;
+    this.rowsFingerprint = null;
+    this.viewing = null;
     this.root = null;
     this.reviewId = null;
     this.snapshotId = null;
@@ -1004,11 +1061,11 @@ export default class Codewalker extends View {
         .child(this.button("send-to-agent", this.sending ? "Sending…" : "Send", cx => this.send(cx), { small: true, primary: true, icon: ICON.send, enabled: !this.sending && ready && items.length > 0 })));
   }
 
-  // Header Send: shown while there is something new (or unclear) to send, and in the Send view.
+  // Toolbar Send: shown while there is something new (or unclear) to send, and in the Send view.
   sendButton() {
     const count = sendable(this.threads).length, on = this.mode === "send";
-    return this.button("open-send", count ? `Send ${count}` : "Unclear", cx => { if (on) { this.mode = this.backMode ?? "files"; cx.notify(); } else this.openSend(cx); },
-      { primary: count > 0 && !on, selected: on, icon: ICON.send, label: "Send to agent", tooltip: on ? "Back" : count ? "Send your new comments to an agent" : "A send is unclear; check it" });
+    return this.button("open-send", this.width < COMPACT_W ? "" : count ? `Send ${count}` : "Unclear", cx => { if (on) { this.mode = this.backMode ?? "files"; cx.notify(); } else this.openSend(cx); },
+      { primary: count > 0 && !on, selected: on, icon: ICON.send, label: "Send to agent", tooltip: on ? "Back" : count ? `Send ${count} new ${count === 1 ? "discussion" : "discussions"} to an agent` : "A send is unclear; check it" });
   }
 
   discussionItem(thread) {
@@ -1116,11 +1173,12 @@ export default class Codewalker extends View {
     return Button.new(id).w_full().h(28).flex_none().px(8).rounded(6).cursor_pointer()
       .bg(o.selected ? t.selected : "#00000000").text_color(o.selected ? t.foreground : t.muted)
       .hover(s => s.bg(o.selected ? t.selected : t.hover).text_color(t.foreground))
-      .accessibility_label(o.label ?? `Review ${path}`).on_mouse_down("left", stop).on_click((_event, cx) => action(cx))
+      .accessibility_label(o.label ?? `Review ${path}${o.viewed ? ", viewed" : ""}`).on_mouse_down("left", stop).on_click((_event, cx) => action(cx))
       .child(h_flex().w_full().gap(7).items_center()
         .child(div().w(12).flex_none().text_size(11).font_family(settings().font_family).text_color(statusColor).child(o.status ?? "•"))
         .child(div().min_w(0).truncate().text_size(12).child(name))
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(o.detail ?? dir))
+        .when(o.viewed, el => el.child(svg(ICON.check).size(12).flex_none().text_color(t.muted)))
         .when(o.threads > 0, el => el.child(h_flex().flex_none().gap(3).items_center().text_size(11).text_color(o.open ? t.accent : t.dim)
           .child(svg(ICON.message).size(11).text_color(o.open ? t.accent : t.dim)).child(String(o.threads))))
         .when(o.additions > 0, el => el.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${o.additions}`)))
@@ -1188,20 +1246,20 @@ export default class Codewalker extends View {
     const retainedPaths = [...new Set(this.threads.map(thread => thread.path).filter(path => !changed.has(path)))];
     // Side by side, a 240px list has no room for line counts; stacked, it spans the panel.
     const counts = !wide || width >= 1000;
-    const pathItems = this.files.map(file => this.pathRow(`file-${file.path}`, file.path, { status: file.status, selected: selected === file.path, threads: threadsAt(file.path).length, open: openAt(file.path), additions: counts ? file.additions : 0, deletions: counts ? file.deletions : 0 }, cx => this.pickFile(file.path, cx)));
+    const shownFiles = this.visibleFiles(), viewedCount = this.files.filter(file => file.viewed).length;
+    const pathItems = shownFiles.map(file => this.pathRow(`file-${file.path}`, file.path, { status: file.status, viewed: file.viewed, selected: selected === file.path, threads: threadsAt(file.path).length, open: openAt(file.path), additions: counts ? file.additions : 0, deletions: counts ? file.deletions : 0 }, cx => this.pickFile(file.path, cx)));
     const totals = this.files.reduce((sum, file) => ({ add: sum.add + (file.additions ?? 0), del: sum.del + (file.deletions ?? 0) }), { add: 0, del: 0 });
     const current = this.files.find(file => file.path === selected);
     const openCount = this.threads.filter(thread => thread.status !== "resolved").length, draftCount = this.drafts?.length ?? 0;
     const awaiting = this.threads.filter(thread => thread.awaitingReply).length;
 
-    const root = this.root ?? this.folder, { name: repo, dir: parent } = splitPath(root || "");
-    const homeDir = home(), shortParent = homeDir && parent.startsWith(homeDir) ? `~${parent.slice(homeDir.length)}` : parent;
+    const root = this.root ?? this.folder;
     const { name: fileName, dir: fileDir } = splitPath(selected ?? "");
     const pickingBase = this.source === "branch" || this.pickBase;
     const baseText = this.baseInput.value().trim();
     // Stacked: the file list takes what its rows need, at most about a third of the height.
-    const listRows = Math.max(1, this.files.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0);
-    const listH = Math.round(Math.min(48 + listRows * 29, Math.max(120, this.height * 0.34)));
+    const listRows = Math.max(1, shownFiles.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0);
+    const listH = Math.round(Math.min(78 + listRows * 29, Math.max(120, this.height * 0.34)));
 
     const navigator = v_flex().flex_none().min_h(0).border_color(t.border)
       .when(wide, el => el.w(sideW).border_r(1))
@@ -1212,8 +1270,13 @@ export default class Codewalker extends View {
         .child(div().flex_1())
         .when(totals.add > 0, el => el.child(div().text_size(11).text_color(t.ansi2).child(`+${totals.add}`)))
         .when(totals.del > 0, el => el.child(div().text_size(11).text_color(t.ansi1).child(`−${totals.del}`))))
+      .when(this.files.length > 0, el => el.child(h_flex().h(30).flex_none().px(14).gap(6).items_center()
+        .child(div().flex_1().text_size(11).text_color(t.muted).child(`${viewedCount} of ${this.files.length} viewed`))
+        .child(this.button("hide-viewed", this.hideViewed ? "Show all" : "Hide viewed", cx => { this.hideViewed = !this.hideViewed; cx.notify(); },
+          { small: true, selected: this.hideViewed, label: this.hideViewed ? "Show all changed files" : "Hide viewed files" }))))
       .child(v_flex().id("review-changed-paths").flex_1().min_h(0).overflow_y_scrollbar().px(6).py(6).gap(1)
         .children(pathItems)
+        .when(this.files.length > 0 && !shownFiles.length, el => el.child(div().px(8).py(6).text_size(12).text_color(t.muted).child("All files viewed.")))
         .when(!this.files.length, el => el.child(div().px(8).py(6).text_size(12).text_color(t.muted)
           .child(this.reading && !this.root ? "Reading changes…" : this.root ? "No changes in this comparison." : "Open a checkout to see its changes.")))
         .when(retainedPaths.length > 0, el => el.child(this.sectionLabel("Discussions on unchanged files")))
@@ -1224,11 +1287,12 @@ export default class Codewalker extends View {
     const diff = v_flex().flex_1().min_h(0).min_w(0)
       .child(h_flex().h(36).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.pendingFile), el => el.child(div().w(12).flex_none().text_size(12).text_color(t.muted).frames(SPIN, 90).child(SPIN[0])))
-        .child(div().flex_none().font_semibold().text_size(12).child(fileName || "No file selected"))
+        .child(div().min_w(0).truncate().font_semibold().text_size(12).child(fileName || "No file selected"))
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(fileDir))
         .when(current?.additions > 0, el => el.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${current.additions}`)))
         .when(current?.deletions > 0, el => el.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${current.deletions}`)))
-        .when(diffW >= 640 && !this.intent && !this.pendingFile && this.rows.length > 0, el => el.child(div().flex_none().pl(8).text_size(11).text_color(t.dim).child("Drag across line numbers to comment"))))
+        .when(Boolean(current), el => el.child(this.viewedBox(current)))
+        .when(diffW >= 760 && !this.intent && !this.pendingFile && this.rows.length > 0, el => el.child(div().flex_none().pl(8).text_size(11).text_color(t.dim).child("Drag across line numbers to comment"))))
       .when(Boolean(this.fileNote), el => el.child(div().flex_none().px(14).py(8).text_size(12).text_color(t.muted).border_b(1).border_color(t.border).child(this.fileNote)))
       // While another file loads, the previous diff stays in place, dimmed and inert.
       .child(v_flex().id(`review-diff-${this.file ?? "empty"}-${visible.start}`).flex_1().min_h(0).overflow_y_scrollbar().pb(16).children(content)
@@ -1263,41 +1327,32 @@ export default class Codewalker extends View {
         else if (this.mode === "send") { this.mode = this.backMode ?? "files"; cx.notify(); cx.stop_propagation(); }
         else if (this.mode === "discussions") { this.mode = "files"; cx.notify(); cx.stop_propagation(); }
       })
-      // Header: what is being reviewed, and where.
-      .child(h_flex().h(42).flex_none().px(14).gap(10).items_center().border_b(1).border_color(t.border)
-        .when(!this.framed, el => el.child(svg("mods/Codewalker/review.svg").size(16).flex_none().text_color(t.muted)))
-        .when(width >= 480 && !this.framed, el => el.child(div().flex_none().font_semibold().child("Review")).child(div().w(1).h(16).flex_none().bg(t.border)))
-        .child(h_flex().flex_1().min_w(0).gap(6).items_center()
-          .child(div().min_w(0).truncate().font_semibold().text_size(12).child(repo || "No checkout"))
-          .when(Boolean(shortParent) && width >= 850, el => el.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(shortParent)))
-          .when(Boolean(this.branch), el => el.child(h_flex().min_w(0).gap(4).items_center().pl(4).text_size(11).text_color(t.muted)
-            .child(svg(ICON["git-branch"]).size(12).flex_none().text_color(t.dim)).child(div().min_w(0).truncate().child(this.branch)))))
-        .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
-        .child(this.button("toggle-discussions", openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
-          { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : "All discussions" }))
-        .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: this.fixed ? "Review another checkout" : "Review another checkout until focus moves to another folder", selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
-        .when(this.mode === "send" || sendable(this.threads).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
-        .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving }))))
-      // Comparison: segmented scope, base ref only for Branch.
-      .child(h_flex().h(40).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+      // One compact toolbar; comparison details live in tooltips, not a title row.
+      .child(h_flex().id("review-controls").min_h(40).flex_none().px(14).py(7).gap(6).flex_wrap().items_center().border_b(1).border_color(t.border)
         .child(h_flex().flex_none().h(26).p(2).gap(2).items_center().rounded(7).bg(t.background).border_1().border_color(t.border)
           .children([["uncommitted", "Uncommitted"], ["branch", "Branch"]].map(([source, label]) => {
             const on = source === "branch" ? pickingBase : !pickingBase;
             return Button.new(`scope-${source}`).h(20).px(10).rounded(5).text_size(12).bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
               .cursor_pointer().hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground)).disabled(this.saving).accessibility_label(`Compare ${label.toLowerCase()} changes`)
+              .tooltip(source === "uncommitted" ? "HEAD → working tree · staged, unstaged and untracked files" : `${this.base || "Choose a base ref"} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}`)
               .on_mouse_down("left", stop).on_click((_event, cx) => {
                 if (source === "uncommitted") { this.pickBase = false; this.applySource("uncommitted", cx); cx.notify(); return; }
                 if (baseText) this.applySource("branch", cx);
                 else { this.pickBase = true; this.baseInput.focus(); cx.notify(); }
               }).child(label);
           })))
-        .when(pickingBase, el => el
+        .child(div().flex_1())
+        .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
+        .child(this.button("toggle-discussions", !compact && openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
+          { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `All discussions · ${openCount} open` }))
+        .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
+        .when(this.mode === "send" || sendable(this.threads).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
+        .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving }))))
+      .when(pickingBase, el => el.child(h_flex().min_h(40).flex_none().px(14).py(7).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
-            .when(compact, el => el.flex_1().min_w(80)).when(!compact, el => el.w(width < 850 ? 130 : 180).flex_none())
+            .flex_1().min_w(0)
             .child(Input.new(this.baseInput).h_full().text_size(12).text_color(t.foreground)))
-          .child(this.button("apply-base", "Compare", cx => this.applySource("branch", cx), { enabled: !this.saving && Boolean(baseText) && (this.source !== "branch" || baseText !== this.base) })))
-        .when(!(compact && pickingBase), el => el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
-          .child(this.source === "branch" ? `${this.base} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}` : pickingBase ? "Enter a base ref, such as main" : "HEAD → working tree, including untracked files"))))
+          .child(this.button("apply-base", "Compare", cx => this.applySource("branch", cx), { enabled: !this.saving && Boolean(baseText) && (this.source !== "branch" || baseText !== this.base) }))))
       // Folder entry: on request, or until a checkout loads.
       .when(this.editRoot || (!this.root && !this.reading), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)

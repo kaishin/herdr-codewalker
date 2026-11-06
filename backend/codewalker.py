@@ -20,8 +20,9 @@ import uuid
 VERSION = 1
 # Store schema; 2 adds messages.reply_requested, 3 adds messages.edited_at and
 # message_edits (earlier bodies), 4 adds deliveries (what was sent to an agent).
+# 5 adds file_views (explicit, per-comparison viewed-file marks).
 # Older stores migrate in place.
-STORE_VERSION = 4
+STORE_VERSION = 5
 DELIVERY_STATES = ("uncertain", "sent")
 MAX_FILE_BYTES = 2_000_000
 MAX_LINES = 50_000
@@ -358,6 +359,16 @@ class Git:
                 old = new = None
             contents[path] = (old, new, old_mark, new_mark)
         entries = [entry for entry in entries if entry["path"] not in no_op_paths]
+        for entry in entries:
+            old_mark, new_mark = contents[entry["path"]][2:]
+            # A file mark is independent of unrelated files and commit IDs. Both
+            # sides, rename identity and modes matter. Do not attest to unreadable
+            # or oversized worktree bytes using only stat/error metadata.
+            entry["diffFingerprint"] = ("diff_" + digest([
+                entry["path"], entry["oldPath"], entry["status"],
+                entry["oldMode"], entry["newMode"], old_mark, new_mark,
+            ]) if isinstance(old_mark, str) and isinstance(new_mark, str)
+                and not entry.get("unsupported") else None)
         snapshot_id = "snapshot_" + digest([scope, base_oid, self.head, [
             [e["path"], e["oldPath"], e["status"], e["oldMode"], e["newMode"],
              contents[e["path"]][2], contents[e["path"]][3]] for e in entries]])
@@ -378,7 +389,7 @@ class Git:
         return result, contents
 
     def file_diff(self, entry, base_oid, content, snapshot_id):
-        result = {"path": entry["path"], "binary": entry["binary"],
+        result = {"path": entry["path"], "diffFingerprint": entry["diffFingerprint"], "binary": entry["binary"],
                   "tooLarge": entry["tooLarge"], "unsupported": entry.get("unsupported", False), "hunks": []}
         if result["binary"] or result["tooLarge"] or result["unsupported"]:
             return result
@@ -502,7 +513,7 @@ class Store:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, STORE_VERSION):
+            if version not in (0, 1, 2, 3, 4, STORE_VERSION):
                 fail("storage_error", "unsupported review database version", version=version)
             # Additive: existing messages keep their text, get no request and are not edited.
             if version == 1:
@@ -519,6 +530,7 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS deliveries (message_id TEXT PRIMARY KEY REFERENCES messages(id), state TEXT NOT NULL, target TEXT NOT NULL, updated_at TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS drafts (review_id TEXT NOT NULL REFERENCES reviews(id), id TEXT NOT NULL, actor TEXT NOT NULL, body TEXT NOT NULL, target TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(review_id,id))",
                 "CREATE TABLE IF NOT EXISTS commands (review_id TEXT NOT NULL REFERENCES reviews(id), id TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(review_id,id))",
+                "CREATE TABLE IF NOT EXISTS file_views (review_id TEXT NOT NULL REFERENCES reviews(id), scope TEXT NOT NULL, base_ref TEXT NOT NULL, path TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(review_id,scope,base_ref,path))",
                 "CREATE INDEX IF NOT EXISTS threads_review ON threads(review_id)",
                 "CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id,sequence)",
             ]:
@@ -579,8 +591,14 @@ class Store:
             result = {"reviewId": self.git.review_id, "revision": self.revision(),
                       "threads": [self.thread(row[0], source, contents) for row in self.db.execute(
                           "SELECT id FROM threads WHERE review_id=? ORDER BY created_at,id", (self.git.review_id,))],
+                      "viewedFiles": {row["path"]: row["fingerprint"] for row in self.db.execute(
+                          "SELECT path,fingerprint FROM file_views WHERE review_id=? AND scope=? AND base_ref=?",
+                          (self.git.review_id, source["scope"], source["baseRef"]))},
                       "drafts": [self.draft(row) for row in self.db.execute(
                           "SELECT * FROM drafts WHERE review_id=? ORDER BY updated_at,id", (self.git.review_id,))]}
+            current = {entry["path"]: entry["diffFingerprint"] for entry in source["files"]}
+            result["viewedFiles"] = {path: mark for path, mark in result["viewedFiles"].items()
+                                     if current.get(path) == mark}
             self.db.commit()
             return result
         except BaseException:
@@ -593,7 +611,8 @@ class Store:
         allowed = {"commandId", "reviewId", "expectedRevision", "actor"} | {
             "create": {"scope", "base", "anchor", "body", "replyRequested"}, "reply": {"threadId", "body", "replyRequested"},
             "resolve": {"threadId", "resolved"}, "edit": {"messageId", "body"}, "delete": {"messageId"}, "deliver": {"messageIds", "state", "target"}, "draft-save": {"draftId", "body", "target"},
-            "draft-delete": {"draftId"}}[operation]
+            "draft-delete": {"draftId"},
+            "file-view": {"scope", "base", "path", "diffFingerprint", "viewed"}}[operation]
         if set(data) - allowed:
             fail("invalid_request", "unknown mutation fields", fields=sorted(set(data) - allowed))
         command_id = text(data.get("commandId"), "commandId", 256)
@@ -652,6 +671,26 @@ class Store:
                 self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?)", (thread_id, self.git.review_id, "open", canonical_json(anchor), timestamp, timestamp))
                 self.add_message(thread_id, actor, body, timestamp, requested)
                 result["thread"] = self.thread(thread_id, source, contents)
+            elif operation == "file-view":
+                path = relative_path(data.get("path"))
+                if type(data.get("viewed")) is not bool:
+                    fail("invalid_request", "viewed must be true or false")
+                given = text(data.get("diffFingerprint"), "diffFingerprint")
+                source, _ = self.git.snapshot(data.get("scope", "uncommitted"), data.get("base"))
+                entry = next((e for e in source["files"] if e["path"] == path), None)
+                if entry is None:
+                    fail("not_found", "file is not in the selected diff", path=path)
+                if not entry["diffFingerprint"]:
+                    fail("invalid_request", "this file has no reliable content fingerprint")
+                if given != entry["diffFingerprint"]:
+                    fail("snapshot_conflict", "this file changed; refresh before marking it viewed")
+                key = (self.git.review_id, source["scope"], source["baseRef"], path)
+                if data["viewed"]:
+                    self.db.execute("INSERT OR REPLACE INTO file_views VALUES(?,?,?,?,?)", (*key, given))
+                else:
+                    self.db.execute("DELETE FROM file_views WHERE review_id=? AND scope=? AND base_ref=? AND path=?", key)
+                result["fileView"] = {"path": path, "diffFingerprint": given, "viewed": data["viewed"],
+                                      "scope": source["scope"], "baseRef": source["baseRef"]}
             elif operation == "deliver":
                 ids = data.get("messageIds")
                 if not isinstance(ids, list) or not ids or len(ids) > 1000 or len(set(map(str, ids))) != len(ids):
@@ -907,7 +946,7 @@ def parse_args(argv):
     parser = Parser(description=__doc__)
     parser.add_argument("--repo")
     parser.add_argument("--store")
-    parser.add_argument("command", choices=["skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "export", "draft-save", "draft-delete"])
+    parser.add_argument("command", choices=["skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete"])
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch"])
     parser.add_argument("--base")
@@ -935,7 +974,9 @@ def execute(args):
                 context = store.context()
                 context["revision"] = listing["revision"]
                 # Internal old blob/mode fields are not protocol surface.
-                files = [{k: v for k, v in entry.items() if k not in ("oldMode", "newMode", "oldOid")} for entry in source["files"]]
+                files = [dict({k: v for k, v in entry.items() if k not in ("oldMode", "newMode", "oldOid")},
+                              viewed=bool(entry["diffFingerprint"] and listing["viewedFiles"].get(entry["path"]) == entry["diffFingerprint"]))
+                         for entry in source["files"]]
                 return dict(source, context=context, files=files, threads=listing["threads"], drafts=listing["drafts"])
             if args.command == "export":
                 listing["text"] = export_text(listing)

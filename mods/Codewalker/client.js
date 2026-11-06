@@ -30,7 +30,7 @@ function fileDetail(file) {
     for (const row of hunk.rows) rows.push({ ...row, kind: KIND[row.kind] ?? row.kind, hunkId: hunk.id });
   }
   const note = file.binary ? "Binary change · no line anchors available" : file.tooLarge ? "This diff exceeds the helper's safe preview limit. Existing discussions remain available." : file.note ?? file.warning ?? null;
-  return { path: file.path, rows, note };
+  return { path: file.path, diffFingerprint: file.diffFingerprint, rows, note };
 }
 
 function humanDrafts(drafts) {
@@ -183,6 +183,11 @@ export class ReviewClient {
   // Delivery record for Send to agent: "uncertain" before, "sent" after, "none" to clear.
   deliver(context, messageIds, state, target, commandId) {
     return this.mutation(context, "deliver", { messageIds, state, target }, commandId);
+  }
+
+  setFileViewed(context, path, diffFingerprint, viewed, commandId) {
+    return this.mutation(context, "file-view", { scope: context.source,
+      ...(context.source === "branch" ? { base: context.baseRef } : {}), path, diffFingerprint, viewed }, commandId);
   }
 
   setStatus(context, threadId, status, commandId) {

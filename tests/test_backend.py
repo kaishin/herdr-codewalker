@@ -60,6 +60,115 @@ class BackendTests(unittest.TestCase):
                 "endLine": 2, "snapshotId": review["snapshotId"]}, "body": body}
         return self.cli("create", data=data), data
 
+    def mark_file(self, review, path="a.txt", viewed=True, command="view1"):
+        file = next(f for f in review["files"] if f["path"] == path)
+        data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": HUMAN,
+                "scope": review["scope"], "base": review["baseRef"], "path": path,
+                "diffFingerprint": file["diffFingerprint"], "viewed": viewed}
+        return self.cli("file-view", data=data), data
+
+    def test_viewed_marks_survive_restart_unrelated_changes_and_explicit_retries(self):
+        review = self.changed()
+        self.assertFalse(review["files"][0]["viewed"], "reading a file never marks it")
+        marked, data = self.mark_file(review)
+        self.assertEqual(self.cli("file-view", data=data), marked)
+        self.assertEqual(self.cli("context")["revision"], 1)
+        (self.root / "other.txt").write_text("unrelated\n")
+        again = self.cli("review", "--file", "a.txt")
+        self.assertNotEqual(again["snapshotId"], review["snapshotId"])
+        self.assertTrue(next(f for f in again["files"] if f["path"] == "a.txt")["viewed"])
+        self.assertEqual(again["file"]["diffFingerprint"], review["file"]["diffFingerprint"])
+        self.create(again)
+        again = self.cli("review", "--file", "a.txt")
+        self.assertTrue(again["files"][0]["viewed"], "a discussion is not a code change")
+        before = self.store.read_bytes()
+        self.cli("review")
+        self.assertEqual(self.store.read_bytes(), before, "viewed reads must not wake the store watcher")
+        unmarked, data = self.mark_file(again, viewed=False, command="unview")
+        self.assertEqual(self.cli("file-view", data=data), unmarked)
+        self.assertFalse(self.cli("review")["files"][0]["viewed"])
+
+    def test_viewed_fingerprints_follow_both_sides_not_commit_ids_or_other_comparisons(self):
+        original_base = self.git("rev-parse", "HEAD")
+        self.git("switch", "-c", "feature")
+        self.changed()
+        branch = self.cli("review", "--scope", "branch", "--base", "main")
+        self.mark_file(branch)
+        self.assertFalse(self.cli("review")["files"][0]["viewed"], "uncommitted has its own checklist")
+        self.git("branch", "other-base", "main")
+        self.assertFalse(self.cli("review", "--scope", "branch", "--base", "other-base")["files"][0]["viewed"])
+        # The new side stays fixed while HEAD and then the base move.
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "feature")
+        self.assertTrue(self.cli("review", "--scope", "branch", "--base", "main")["files"][0]["viewed"])
+        self.git("switch", "main")
+        (self.root / "other.txt").write_text("unrelated\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "unrelated base change")
+        self.git("switch", "feature")
+        self.git("merge", "--no-edit", "main")
+        same = self.cli("review", "--scope", "branch", "--base", "main")
+        self.assertTrue(same["files"][0]["viewed"], "moving the base elsewhere preserves this file's mark")
+        # A new base has the same working file, but a different removed side.
+        self.git("branch", "-f", "main", "feature")
+        (self.root / "a.txt").write_text("one\nthree\n")
+        fresh = self.cli("review", "--scope", "branch", "--base", "main")
+        self.mark_file(fresh, command="view-new-diff")
+        self.git("branch", "-f", "main", original_base)
+        changed_base = self.cli("review", "--scope", "branch", "--base", "main")
+        self.assertFalse(changed_base["files"][0]["viewed"], "changing only the old side invalidates a mark")
+
+    def test_viewed_rejects_stale_file_but_not_unrelated_file_edits(self):
+        review = self.changed()
+        (self.root / "other.txt").write_text("unrelated\n")
+        _, data = self.mark_file(review)
+        (self.root / "a.txt").write_text("one\nnewer\nthree\n")
+        fresh = self.cli("review")
+        self.assertFalse(fresh["files"][0]["viewed"])
+        data.update(commandId="stale-view", expectedRevision=fresh["context"]["revision"])
+        self.cli("file-view", data=data, error="snapshot_conflict")
+        self.assertEqual(self.cli("context")["revision"], 1, "a refused mark leaves no receipt or revision")
+        self.mark_file(fresh, command="new-view")
+        # File modes are part of the review even when the bytes do not change.
+        self.git("config", "core.filemode", "true")
+        (self.root / "a.txt").chmod(0o755)
+        self.assertFalse(self.cli("review")["files"][0]["viewed"])
+        self.git("switch", "-c", "other-review")
+        self.assertFalse(self.cli("review")["files"][0]["viewed"], "a different branch starts unviewed")
+
+    def test_viewed_handles_binary_deleted_renamed_and_unfingerprinted_files(self):
+        for name, raw in (("binary", b"old\0"), ("deleted", b"delete me\n"), ("rename", b"rename me\n")):
+            (self.root / name).write_bytes(raw)
+        self.git("add", ".")
+        self.git("commit", "-qm", "fixtures")
+        (self.root / "binary").write_bytes(b"new\0")
+        (self.root / "deleted").unlink()
+        self.git("mv", "rename", "renamed")
+        (self.root / "untracked").write_text("new\n")
+        (self.root / "huge").write_bytes(b"x" * 2_000_001)
+        (self.root / "link").symlink_to("a.txt")
+        for path in ("binary", "deleted", "renamed", "untracked"):
+            result = self.cli("review")
+            self.mark_file(result, path, command="view-" + path)
+        files = {f["path"]: f for f in self.cli("review")["files"]}
+        self.assertTrue(all(files[p]["viewed"] for p in ("binary", "deleted", "renamed", "untracked")))
+        for path in ("huge", "link"):
+            self.assertIsNone(files[path]["diffFingerprint"])
+            self.assertFalse(files[path]["viewed"])
+            self.cli("file-view", data={"commandId": path, "expectedRevision": 4, "actor": HUMAN,
+                     "path": path, "diffFingerprint": "invented", "viewed": True}, error="invalid_request")
+
+    def test_v4_store_adds_viewed_marks_without_changing_existing_discussions(self):
+        created, _ = self.create()
+        with sqlite3.connect(self.store) as db:
+            db.execute("DROP TABLE file_views")
+            db.execute("PRAGMA user_version=4")
+        review = self.cli("review")
+        self.assertEqual(review["threads"][0]["id"], created["thread"]["id"])
+        self.assertFalse(review["files"][0]["viewed"])
+        self.mark_file(review)
+        self.assertTrue(self.cli("review")["files"][0]["viewed"])
+
     def test_uncommitted_coordinates_untracked_and_index_are_read_only(self):
         (self.root / "a.txt").write_text("one\nstaged\nthree\n", encoding="utf-8")
         self.git("add", "a.txt")
@@ -384,7 +493,7 @@ class BackendTests(unittest.TestCase):
                 self.assertIsNone(thread["messages"][0]["editedAt"])
                 self.assertFalse(thread["awaitingReply"])
                 with sqlite3.connect(self.store) as db:
-                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
                 # The migrated store takes edits.
                 message = thread["messages"][0]["id"]
                 self.cli("edit", data={"commandId": f"edit-v{version}", "expectedRevision": 1, "actor": HUMAN, "messageId": message, "body": "Edited"})

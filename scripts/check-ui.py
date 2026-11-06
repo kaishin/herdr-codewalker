@@ -17,7 +17,8 @@ export default class Fixture extends Codewalker {
     this.folder = this.root = "/synthetic/example-checkout";
     this.reviewId = "synthetic-review"; this.snapshotId = "synthetic-snapshot"; this.revision = 4;
     this.branch = "example-feature"; this.file = "src/example.py";
-    this.files = [{path:this.file,status:"M",additions:1,deletions:1}];
+    this.files = [{path:this.file,status:"M",additions:1,deletions:1,diffFingerprint:"synthetic-diff",viewed:false}];
+    this.rowsFingerprint = "synthetic-diff";
     this.rows = [{kind:"@",text:"@@ -1,2 +1,2 @@"},{kind:"-",oldLine:1,newLine:null,text:"old_value = 1"},{kind:"+",oldLine:null,newLine:1,text:"new_value = 2"},{kind:" ",oldLine:2,newLine:2,text:"print(value)"}];
     const anchor = {side:"new",startLine:1,endLine:1,snippet:"new_value = 2"};
     this.threads = [{id:"synthetic-thread",path:this.file,anchor,status:"open",messages:[{id:"synthetic-human",actor:{kind:"human",id:"local",name:"You"},body:"Synthetic fixture: why change this value?",createdAt:"2026-01-01T10:00:00Z"},{id:"synthetic-agent",actor:{kind:"agent",id:"example",name:"Example agent"},body:"Synthetic fixture: it corrects the boundary condition.",createdAt:"2026-01-01T10:01:00Z"}]},{id:"synthetic-outdated",path:this.file,anchor:{...anchor,startLine:40,endLine:40,snippet:"original_code()"},outdated:true,status:"resolved",messages:[{id:"synthetic-old",actor:{kind:"human",id:"local",name:"You"},body:"Synthetic fixture: retained discussion.",createdAt:"2026-01-01T10:00:00Z"}]}];
@@ -92,12 +93,21 @@ def main():
         editing = 'this.editing = {id:"synthetic-human", body:"Synthetic fixture: why change this value?", commandId:"c"}; this.editor.set_value(this.editing.body);'
         deleting = 'this.confirmDelete = "synthetic-human";'
         sending = 'this.width = 368; this.height = 900; this.mode = "send";'
-        for pending, extra in (("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending)):
+        viewed = 'this.width = 368; this.height = 900; this.files[0].viewed = true;'
+        hidden = viewed + ' this.hideViewed = true;'
+        branch = 'this.width = 368; this.height = 900; this.source = "branch"; this.base = "main"; this.baseInput.set_value("main");'
+        for pending, extra in (("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
-            narrow = extra == docked
+            narrow = extra in (docked, viewed, hidden, branch)
+            lines = spec.splitlines()
+            root = next(i for i, line in enumerate(lines) if ':id[Str("codewalker")]' in line)
+            assert ':id[Str("review-controls")]' in lines[root + 1], "Scope and actions are the first row; no title row above them"
+            check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"')
+            assert 'text "HEAD → working tree' not in spec, "Comparison explanation belongs in a tooltip, not a text row"
+            assert ('Button "apply-base"' in spec) == (extra == branch), "Branch comparison keeps an explicit base editor"
             if extra == sending:
                 # The exact text to paste, agent choice, and a Send that waits for a ready agent.
                 assert ':id[Str("review-send")]' in spec and 'Button "send-to-agent"' in spec, "Send view shows its preview and Send"
@@ -106,7 +116,7 @@ def main():
                 print(result.stderr.strip())
                 continue
             if not extra:
-                assert 'Button "open-send"' in spec, "Unsent comments offer Send in the header"
+                assert 'Button "open-send"' in spec, "Unsent comments offer Send in the toolbar"
                 # Comment bodies are Markdown (TextView), not plain text.
                 assert 'message-body-synthetic-human' in spec, "Comment bodies render as Markdown"
             if extra == listing:
@@ -117,6 +127,11 @@ def main():
                 assert "WARN" not in result.stderr, result.stderr
                 print(result.stderr.strip())
                 continue
+            assert ('Checkbox "file-viewed"' in spec) == (pending == "null"), "Loaded changed files offer an explicit Viewed checkbox"
+            assert 'Button "hide-viewed"' in spec, "The file list offers a reversible viewed filter"
+            assert ('"1 of 1 viewed"' in spec) == (extra in (viewed, hidden)), "Progress reflects the saved marks"
+            assert ('"All files viewed."' in spec) == (extra == hidden), "A filtered-empty list explains how it became empty"
+            assert ('Button "file-src/example.py"' in spec) == (extra != hidden), "Hide viewed removes only marked file rows"
             # The first comment asks before it takes the thread; replies of others have no Delete.
             assert ('"Delete thread"' in spec) == (extra == deleting), "Deleting the comment asks first and names the thread"
             assert "delete-synthetic-agent" not in spec, "Only your own messages offer Delete"
@@ -135,9 +150,9 @@ def main():
             assert ('"Comment on lines 1–2"' in spec) == (extra == hover), "A range comment names its lines"
             assert '"Ask for a short reply"' in spec, "Every open composer offers a short-reply request"
             assert ("edit-synthetic-human" in spec) == (extra not in (editing, deleting)) and "edit-synthetic-agent" not in spec, "Only your own messages offer Edit"
-            assert ('"Awaiting reply"' in spec) == narrow, "A thread owed a reply says so"
+            assert ('"Awaiting reply"' in spec) == (extra == docked), "A thread owed a reply says so"
             # Resolve carries a check mark; a checked reply request adds one more.
-            assert spec.count("icons/check.svg") == 1 + narrow, "Resolve and a checked request show a check mark"
+            assert spec.count("icons/check.svg") == 1 + (extra == docked) + (2 if extra == viewed else 1 if extra == hidden else 0), "Resolve and a checked request show a check mark"
             if not extra:
                 assert all(f"icons/{name}.svg" in spec for name in ("reply", "pencil", "trash")), "Reply, Edit and Delete show their icons"
             assert "WARN" not in result.stderr, result.stderr
