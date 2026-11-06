@@ -5,6 +5,7 @@
 ## Structure
 
 - Review opens as a Herdr pane right of the focused pane (`mod.open Codewalker`, bound to a key, or `backend.py open`). No tab-bar copy and no custom layout: they don't get Herdr's updates and don't compose with other mods.
+- In a layout the person owns, a `Codewalker` block with props `{toolbar: true}` beside the shipped `tabs` block draws a **Review** button, the same control as Files and Changes. It shows the `review` child of the `panel-body` stack. Docked, Review draws a card like Changes and follows the focused terminal's folder. There the key (`mod.open Codewalker`) toggles the side panel, not a pane. Codewalker never copies the tab bar or ships a layout.
 - As a pane, Review shows the folder of the pane it opened beside, and Herdr draws its frame and header. Without a folder (the focused pane had none), it shows the focused terminal's folder, else the active space's folder (never its name), and follows focus; a draft is saved before it follows. The folder button (icon only) reviews another checkout.
 - Responsive: below 760 px the changed-path list sits above the diff, at most about a third of the height; wider, the two sit side by side. Below 560 px line-number columns narrow and discussion cards lose their gutter inset. Header and scope bar drop secondary labels before they truncate the checkout.
 - Source strip: Uncommitted, Branch, explicit local base ref, resolved comparison label, Refresh.

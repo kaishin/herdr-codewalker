@@ -27,7 +27,7 @@ async function modules(overrides = {}) {
   const values = {
     "gpui-kit": { View: class {}, div() {}, svg() {} },
     "gpui-base": { h_flex() {}, v_flex() {}, Button: {}, Checkbox: {}, InputState: { new: options => new State(options) }, Input: {}, TextareaState: { new: options => new State(options) }, Textarea: {}, TextView: {} },
-    herdr: { props: () => ({}), spaces: () => [], panes: () => [], focused: () => null, agents: () => [], hc: async () => { throw new Error("Unexpected hc call"); }, run() {}, notify() {}, appHome: () => "/app", home: () => "/home", theme: () => ({}), settings: () => ({}), closeOverlay() {}, nextCommand: () => new Promise(() => {}), watchFolder: async () => { throw new Error("No folder watch in tests"); }, exec: async () => { throw new Error("Unexpected helper invocation"); }, ...overrides },
+    herdr: { props: () => ({}), spaces: () => [], panes: () => [], focused: () => null, agents: () => [], hc: async () => { throw new Error("Unexpected hc call"); }, run() {}, notify() {}, appHome: () => "/app", home: () => "/home", theme: () => ({}), settings: () => ({}), closeOverlay() {}, layout: () => null, shared: () => undefined, setShared() {}, nextCommand: () => new Promise(() => {}), watchFolder: async () => { throw new Error("No folder watch in tests"); }, exec: async () => { throw new Error("Unexpected helper invocation"); }, ...overrides },
   };
   async function load(name) {
     if (cache.has(name)) return cache.get(name);
@@ -274,6 +274,41 @@ test("a read that began before a concurrent draft save cannot roll discussions b
   await drain();
   assert.deepEqual(view.threads.map(thread => thread.id), ["after-post"]);
   assert.equal(view.revision, 5);
+});
+
+test("the tab-bar button adds Review to the side panels the tab bar remembers, once", async () => {
+  let current = {}, panels = ["files", "changes"];
+  const writes = [];
+  const { load } = await modules({ props: () => current, shared: key => key === "workspace.panels" ? panels : undefined, setShared: (key, value) => { writes.push([key, value]); panels = value; } });
+  const main = await load(path.join(root, "mods/Codewalker/main.js"));
+  current = { toolbar: true };
+  for (let i = 0; i < 2; i++) new main.namespace.default().init({}, { spawn() { throw new Error("The button starts no work"); } });
+  assert.equal(JSON.stringify(writes), JSON.stringify([["workspace.panels", ["files", "changes", "review"]]]));
+});
+
+test("the key toggles the docked side panel when the layout has one, else a pane", async () => {
+  let current = {}, tree = null;
+  const calls = [];
+  const { load } = await modules({ props: () => current, layout: () => tree, run: (name, args) => calls.push(`${name} ${JSON.stringify(args)}`),
+    panes: () => [{ pane: "p1", tab: "t1", focused: true, cwd: "/checkout" }] });
+  const main = await load(path.join(root, "mods/Codewalker/main.js"));
+  const press = async () => {
+    calls.length = 0;
+    current = { launch: true, overlay: "o1" };
+    const tasks = [];
+    new main.namespace.default().init({}, { spawn: action => tasks.push(action()) });
+    await Promise.all(tasks);
+    return [...calls];
+  };
+  const docked = (hidden, active) => ({ id: "root", children: [{ id: "panel", hidden, children: [{ id: "panel-body", active, children: [{ id: "files" }, { id: "review" }] }] }] });
+  tree = docked(true, "files");
+  assert.deepEqual(await press(), ['layout.select {"stack":"panel-body","child":"review"}', 'layout.show {"id":"panel"}']);
+  tree = docked(false, "files");
+  assert.deepEqual(await press(), ['layout.select {"stack":"panel-body","child":"review"}', 'layout.show {"id":"panel"}'], "another panel switches to Review");
+  tree = docked(false, "review");
+  assert.deepEqual(await press(), ['layout.hide {"id":"panel"}']);
+  tree = { id: "root", children: [{ id: "panel", children: [{ id: "panel-body", children: [{ id: "files" }] }] }] };
+  assert.deepEqual(await press(), ['pane.split {"direction":"right","pane":"p1","mod":"Codewalker","props":{"framed":true,"folder":"/checkout"}}']);
 });
 
 test("switching files keeps the shown diff until the next arrives, newest click wins, revisits are instant", async () => {

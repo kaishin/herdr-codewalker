@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { props, spaces, panes, focused, agents, hc, run, notify, appHome, home, theme, settings, closeOverlay, nextCommand, watchFolder } from "herdr";
+import { props, spaces, panes, focused, agents, hc, run, notify, appHome, home, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
 import { ReviewClient, HUMAN } from "./client.js";
 import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, sendText, utf8Bytes, markdownBody } from "./model.js";
 
@@ -45,14 +45,62 @@ function toggleReviewPane() {
   run("pane.split", { direction: "right", pane: here.pane, mod: "Codewalker", props: { framed: true, ...(here.cwd ? { folder: here.cwd } : {}) } });
 }
 
+function findNode(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = findNode(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+// The side panel ("panel" / "panel-body") when this layout docks Review in it.
+function reviewPanel() {
+  const root = layout(), panel = findNode(root, "panel"), body = findNode(root, "panel-body");
+  if (!panel || !body?.children?.some(c => c.id === "review")) return null;
+  return { on: !panel.hidden && body.active === "review" };
+}
+
+function toggleReviewPanel(on) {
+  if (on) run("layout.hide", { id: "panel" });
+  else { run("layout.select", { stack: "panel-body", child: "review" }); run("layout.show", { id: "panel" }); }
+}
+
+// The key: the side panel when the layout docks Review, else a pane.
+function toggleReview() {
+  const docked = reviewPanel();
+  if (docked) toggleReviewPanel(docked.on);
+  else toggleReviewPane();
+}
+
+// A Review button for a layout's tab bar: a block beside the shipped tabs mod,
+// the same control as its Files and Changes buttons.
+function reviewButton() {
+  const t = theme(), on = Boolean(reviewPanel()?.on);
+  return h_flex().size_full().pr(10).justify_end().items_center().bg(t.chrome).border_b(1).border_color(t.border)
+    .child(h_flex().id("panel-review").h(26).px(8).gap(5).flex_none().items_center().rounded(6).text_size(12)
+      .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
+      .hover(s => s.bg(t.hover)).on_mouse_down("left", stop)
+      .on_click(() => toggleReviewPanel(on))
+      .child(svg("mods/Codewalker/review.svg").size(14)).child("Review"));
+}
+
 export default class Codewalker extends View {
   init(_props, cx) {
     const p = props() ?? {};
-    // mod.open Codewalker (a key, the palette): only a launcher. It toggles the
-    // Review pane, then closes itself.
+    // props {toolbar: true}: only the tab-bar button. The shipped tab bar
+    // remembers the side panel per space for the panels in "workspace.panels".
+    if (p.toolbar) {
+      this.toolbar = true;
+      const panels = shared("workspace.panels") ?? ["files", "changes"];
+      if (!panels.includes("review")) setShared("workspace.panels", [...panels, "review"]);
+      return;
+    }
+    // mod.open Codewalker (a key): only a launcher. It toggles Review (the side
+    // panel when the layout docks it, else a pane), then closes itself.
     if (p.launch) {
       this.launcher = true;
-      cx.spawn(async () => { toggleReviewPane(); closeOverlay(p.overlay); });
+      cx.spawn(async () => { toggleReview(); closeOverlay(p.overlay); });
       return;
     }
     // A window opened for one space keeps it. The docked panel follows focus.
@@ -1095,7 +1143,12 @@ export default class Codewalker extends View {
 
   render(cx) {
     if (this.launcher) return div();
-    this.follow(cx);
+    if (this.toolbar) return reviewButton();
+    // Following focus can save a draft and reread, which notifies; render may not.
+    if (!this.fixed) {
+      const here = location(this.spaceId);
+      if (here && here.key !== this.followed && here.key !== this.following) cx.spawn(async cx => this.follow(cx));
+    }
     this.settleJump();
     const t = theme(), width = this.width, wide = width >= SPLIT_W, compact = width < COMPACT_W;
     const sideW = width >= 1000 ? 280 : 240, diffW = wide ? width - sideW : width, num = compact ? 34 : 46;

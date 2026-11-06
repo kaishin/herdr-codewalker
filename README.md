@@ -1,6 +1,6 @@
 # Codewalker
 
-Native code review for Herdr: uncommitted and branch diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
+Native code review for Herdr: uncommitted and branch diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
 
 ## Requirements and boundaries
 
@@ -51,6 +51,27 @@ Add a key to your `keys.json` yourself; the installer doesn't edit it:
 ```
 
 The key opens Review as a pane right of the focused pane, for that pane's folder. Press it again in the same tab to close it. In a terminal, `python3 ~/.config/herdr-app/mods/Codewalker/backend.py open` does the same for that terminal (`--repo` for another checkout). The command palette can't list mod commands, so it has no Review entry.
+
+### Review in the side panel (your own layout)
+
+Codewalker ships no layout. In a layout you own (a copy of `main`), it can also sit in the side panel, opened by a **Review** button beside the tab bar, like Files and Changes:
+
+1. Replace the `tabs` block with a row that holds it and the button:
+
+   ```json
+   { "id": "tab-bar", "type": "row", "size": { "px": 42 }, "resizable": false, "children": [
+     { "id": "tabs", "type": "block", "size": { "weight": 1 }, "window_drag": true, "content": { "mod": "tabs" } },
+     { "id": "review-button", "type": "block", "size": { "px": 88 }, "window_drag": true, "content": { "mod": "Codewalker", "props": { "toolbar": true } } }
+   ] }
+   ```
+
+2. Add Review to the `panel-body` stack, after `changes`:
+
+   ```json
+   { "id": "review", "type": "block", "content": { "mod": "Codewalker" } }
+   ```
+
+The button adds `"review"` to the shared `workspace.panels` list, so the tab bar remembers Review per space like the other panels. In such a layout the key toggles the side panel instead of a pane. In the side panel Review shows the focused terminal's checkout and follows focus.
 
 ## Review flow
 
