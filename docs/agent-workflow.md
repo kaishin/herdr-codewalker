@@ -23,11 +23,13 @@ cw review --scope uncommitted                  # Changed paths, pinned identity 
 cw review --scope uncommitted --file "$FILE" > "$WORK/review.json"
 # Alternative: committed + uncommitted branch work since the merge-base with main:
 # cw review --scope branch --base main --file "$FILE" > "$WORK/review.json"
+# Alternative: only one commit, against its first parent (no working-tree edits):
+# cw review --scope commit --commit HEAD~1 --file "$FILE" > "$WORK/review.json"
 ```
 
 Each result is one JSON value: `{ok:true,protocolVersion:1,data:...}`. Failures have `ok:false`, `error.code`, `error.message`, optional `error.details`, and exit 1. Check `ok` before using data.
 
-The saved review contains `data.context.{repoRoot,branch,reviewId,revision}`, `data.snapshotId`, explicit comparison refs/OIDs, changed-file summaries, and `data.file.hunks[].rows[]` with old/new Git coordinates. Pin `reviewId`; never infer it from an overlay ID, space title, terminal cwd, or branch label alone. Snapshot IDs identify source content, not discussion revision.
+The saved review contains `data.context.{repoRoot,branch,reviewId,revision}`, `data.snapshotId`, explicit comparison refs/OIDs, changed-file summaries, and `data.file.hunks[].rows[]` with old/new Git coordinates. Pin `reviewId`; never infer it from an overlay ID, space title, terminal cwd, or branch label alone. Snapshot IDs identify source content, not discussion revision. Commit reviews also return `commitOid`; use this full SHA in later `--commit` reads and `commit` mutation fields. Do not reuse a moving ref for an inspected snapshot. A commit anchor has `commitOid`; inspect that version for the question and the current code before making changes.
 
 ## 2. Create an agent-authored inline thread
 
@@ -55,7 +57,8 @@ request = {
     "reviewId": r["context"]["reviewId"],
     "expectedRevision": r["context"]["revision"],
     "actor": {"kind": "agent", "id": "example-agent", "name": "Example agent"},
-    "scope": r["scope"], "base": r["baseRef"],
+    "scope": r["scope"],
+    **({"commit": r["commitOid"]} if r["scope"] == "commit" else {"base": r["baseRef"]}),
     "anchor": {"path": r["file"]["path"], "side": side,
                "startLine": line, "endLine": line, "snapshotId": r["snapshotId"]},
     "body": "Please confirm the intended behavior at this boundary.\n\nI will preserve this discussion while checking the implementation."
@@ -132,7 +135,7 @@ Export is nonconsuming; it never clears notes or sends/submits agent input.
 
 `review` returns `files[].viewed` and `files[].diffFingerprint`, plus the selected `file.diffFingerprint`. Marks are the reviewer's local checklist; do not change them unless asked. A read never marks a file.
 
-When asked, use `file-view` with the common mutation envelope and `{scope, base, path, diffFingerprint, viewed:true}` (or `false` to unmark). Take the fingerprint from the diff you actually inspected, not a newer summary. The backend checks it again; a changed file fails with `snapshot_conflict`. An unrelated changed file does not invalidate your evidence. A null fingerprint cannot be marked. Keep the exact request for retries, as with discussions. Marks and discussions share one revision, so refresh after either changes. There is no GitHub sync yet.
+When asked, use `file-view` with the common mutation envelope and `{scope, base, path, diffFingerprint, viewed:true}` (replace `base` with `commit: commitOid` in commit scope) (or `false` to unmark). Take the fingerprint from the diff you actually inspected, not a newer summary. The backend checks it again; a changed file fails with `snapshot_conflict`. An unrelated changed file does not invalidate your evidence. A null fingerprint cannot be marked. Keep the exact request for retries, as with discussions. Marks and discussions share one revision, so refresh after either changes. There is no GitHub sync yet.
 
 ## Feedback the reviewer sends you
 
@@ -140,7 +143,7 @@ When asked, use `file-view` with the common mutation envelope and `{scope, base,
 
 ## Show Review to the reviewer
 
-`python3 "$CW" open` in a Herdr terminal opens Review as a pane right of that terminal, for its folder (or `--repo`).
+`python3 "$CW" open` in a local Herdr terminal opens Review as a pane right of that terminal, for its folder (or `--repo`). Add `--scope commit --commit <SHA-or-ref>` to open a specific commit, or `--scope branch --base <ref>` for branch mode. The returned `pane` is the newly created pane. Other mods use `pane.split` with `props:{framed:true, folder, scope:"commit", commit}`; see the public props contract in [protocol.md](protocol.md).
 
 ## Conflicts and uncertain outcomes
 

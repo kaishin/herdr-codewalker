@@ -96,18 +96,35 @@ def main():
         viewed = 'this.width = 368; this.height = 900; this.files[0].viewed = true;'
         hidden = viewed + ' this.hideViewed = true;'
         branch = 'this.width = 368; this.height = 900; this.source = "branch"; this.base = "main"; this.baseInput.set_value("main");'
-        for pending, extra in (("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch)):
+        commit = 'this.width = 368; this.height = 900; this.source = "commit"; this.commitOid = "0123456789abcdef"; this.commitParents = 2; this.commitInput.set_value("HEAD~1");'
+        cached = 'this.width = 368; this.height = 900; this.rememberComparison(); this.resetContext({keepComparisons:true}); this.restoreComparison(); this.reading = true;'
+        for pending, extra in (("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
-            narrow = extra in (docked, viewed, hidden, branch)
+            narrow = extra in (docked, viewed, hidden, branch, commit, cached)
             lines = spec.splitlines()
             root = next(i for i, line in enumerate(lines) if ':id[Str("codewalker")]' in line)
             assert ':id[Str("review-controls")]' in lines[root + 1], "Scope and actions are the first row; no title row above them"
             check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"')
             assert 'text "HEAD → working tree' not in spec, "Comparison explanation belongs in a tooltip, not a text row"
             assert ('Button "apply-base"' in spec) == (extra == branch), "Branch comparison keeps an explicit base editor"
+            assert 'Button "scope-commit"' in spec, "Commit is the third scope"
+            assert ('Button "apply-commit"' in spec) == (extra == commit), "Commit mode keeps a SHA/ref input and Show"
+            if extra == commit:
+                assert '"01234567"' in spec and 'first parent' in spec, "Commit mode identifies the resolved SHA and comparison"
+            if extra == cached:
+                check_content_height(spec, stacked=True)
+                assert 'new_value = 2' in spec and 'Button "file-src/example.py"' in spec, "A restored mode shows its files and diff during revalidation"
+                assert 'Reading changes' not in spec and 'Loading diff' not in spec and '.opacity' not in spec, "Cached mode switches must not blank or dim the diff"
+                checkbox = next(line for line in lines if 'Checkbox "file-viewed"' in line)
+                assert ':disabled[Bool(true)]' in checkbox, "Cached Viewed state is read-only until revalidated"
+                resolve = next(line for line in lines if 'Button "status-synthetic-thread"' in line)
+                assert ':disabled[Bool(true)]' in resolve, "Cached discussions cannot be mutated before revalidation"
+                assert "WARN" not in result.stderr, result.stderr
+                print(result.stderr.strip())
+                continue
             if extra == sending:
                 # The exact text to paste, agent choice, and a Send that waits for a ready agent.
                 assert ':id[Str("review-send")]' in spec and 'Button "send-to-agent"' in spec, "Send view shows its preview and Send"

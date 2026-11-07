@@ -85,6 +85,7 @@ export class ReviewClient {
   sourceArgs(context) {
     const args = ["--scope", context.source ?? "uncommitted"];
     if (context.source === "branch" && context.baseRef) args.push("--base", context.baseRef);
+    if (context.source === "commit") args.push("--commit", context.commitRef ?? "");
     return args;
   }
 
@@ -93,7 +94,10 @@ export class ReviewClient {
   // read for its current review identity.
   async review(context, path = null) {
     const args = this.sourceArgs(context);
-    const known = context.reviewId && this.latest?.context?.reviewId === context.reviewId ? this.latest.files : null;
+    const sameSource = this.latest?.scope === (context.source ?? "uncommitted")
+      && (context.source !== "branch" || this.latest.baseRef === context.baseRef)
+      && (context.source !== "commit" || this.latest.commitOid === context.commitRef);
+    const known = sameSource && context.reviewId && this.latest?.context?.reviewId === context.reviewId ? this.latest.files : null;
     // Retained discussions must never trigger an unchanged-file browsing fallback.
     let data = null;
     if (path && !(known && !known.some(file => file.path === path))) {
@@ -105,7 +109,7 @@ export class ReviewClient {
     const detail = data.file ? fileDetail(data.file) : path ? { path, rows: [], note: RETAINED } : null;
     return {
       root: data.context.repoRoot, reviewId: data.context.reviewId, revision: data.context.revision,
-      branch: data.context.branch, storePath: data.context.storePath, snapshotId: data.snapshotId, baseRef: data.baseRef, baseOid: data.baseOid,
+      branch: data.context.branch, storePath: data.context.storePath, snapshotId: data.snapshotId, baseRef: data.baseRef, baseOid: data.baseOid, commitOid: data.commitOid, parentCount: data.parentCount,
       files: data.files.map(file => ({ ...file, status: STATUS[file.status] ?? file.status })),
       threads: data.threads.map(normalizeThread), drafts: humanDrafts(data.drafts), note: data.warnings?.join(" · "), detail,
     };
@@ -135,7 +139,7 @@ export class ReviewClient {
   }
 
   saveDraft(context, intent, body) {
-    return this.mutation(context, "draft-save", { draftId: intent.id, body, target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: this.attempts.get(intent.id) ?? intent.pendingPost, replyRequested: intent.replyRequested === true, scope: context.source, base: context.baseRef } });
+    return this.mutation(context, "draft-save", { draftId: intent.id, body, target: { path: intent.path, anchor: intent.anchor, threadId: intent.threadId, snapshotId: intent.snapshotId, context: intent.context ?? context, pendingPost: this.attempts.get(intent.id) ?? intent.pendingPost, replyRequested: intent.replyRequested === true, scope: context.source, base: context.baseRef, commit: context.commitRef } });
   }
 
   deleteDraft(context, draftId) {
@@ -155,7 +159,7 @@ export class ReviewClient {
       if (!entry) {
         const revision = this.revisions.get(context.reviewId) ?? context.revision;
         const command = intent.threadId ? "reply" : "create";
-        const data = intent.threadId ? { threadId: intent.threadId, body } : { scope: context.source, ...(context.source === "branch" ? { base: context.baseRef } : {}), anchor: { path: intent.path, side: intent.anchor.side, startLine: intent.anchor.startLine, endLine: intent.anchor.endLine, snapshotId: intent.snapshotId }, body };
+        const data = intent.threadId ? { threadId: intent.threadId, body } : { scope: context.source, ...(context.source === "branch" ? { base: context.baseRef } : context.source === "commit" ? { commit: context.commitRef } : {}), anchor: { path: intent.path, side: intent.anchor.side, startLine: intent.anchor.startLine, endLine: intent.anchor.endLine, snapshotId: intent.snapshotId }, body };
         const payload = { commandId, reviewId: context.reviewId, expectedRevision: revision + 1, actor: HUMAN, ...data, ...(intent.replyRequested ? { replyRequested: true } : {}) };
         const receipt = { commandId, context, operation: command, payload };
         // Persist the exact post envelope BEFORE invoking it. The draft commit advances revision by one.
@@ -187,7 +191,7 @@ export class ReviewClient {
 
   setFileViewed(context, path, diffFingerprint, viewed, commandId) {
     return this.mutation(context, "file-view", { scope: context.source,
-      ...(context.source === "branch" ? { base: context.baseRef } : {}), path, diffFingerprint, viewed }, commandId);
+      ...(context.source === "branch" ? { base: context.baseRef } : context.source === "commit" ? { commit: context.commitRef } : {}), path, diffFingerprint, viewed }, commandId);
   }
 
   setStatus(context, threadId, status, commandId) {

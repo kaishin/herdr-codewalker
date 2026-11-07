@@ -124,6 +124,7 @@ export function sendText({ items, root, branch, helper, note }) {
     const a = thread.anchor ?? {};
     const range = a.startLine === a.endLine ? `line ${a.startLine}` : `lines ${a.startLine}-${a.endLine}`;
     lines.push("", `### ${thread.path}, ${range}${a.side === "old" ? " (removed side)" : ""} · thread ${thread.id}${threadIsOutdated(thread) ? " · code changed since" : ""}${thread.awaitingReply ? " · short reply requested" : ""}`);
+    if (a.commitOid) lines.push(`Historical commit ${a.commitOid}; inspect the current code before making changes.`);
     if (a.snippet) lines.push("```", a.snippet, "```");
     for (const message of thread.messages) {
       const who = isHuman(message) ? "Reviewer" : `${message.actor?.name ?? "Agent"} (${message.actor?.kind ?? "agent"})`;

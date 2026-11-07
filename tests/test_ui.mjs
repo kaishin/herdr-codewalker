@@ -746,3 +746,251 @@ test("hide viewed is reversible, preserves selection and reveals changed files o
   assert.equal(view.rowsFingerprint, "diff-new");
   assert.equal(view.composer.value(), "Human question");
 });
+
+test("other mods can open a pinned commit review with props, and refresh keeps the resolved SHA", async () => {
+  const reads = [];
+  const { view, cx, drain } = await modules({
+    props: () => ({ framed: true, folder: "/caller/checkout", scope: "commit", commit: "HEAD~1" }),
+    client: { review: async context => { reads.push({ ...context }); return { ...review(), root: context.root, commitOid: "commit-a", parentCount: 1 }; } },
+  });
+  await settle(); // init's opening read starts before the test harness takes over.
+  await drain();
+  assert.equal(reads[0].root, "/caller/checkout");
+  assert.equal(reads[0].source, "commit");
+  assert.equal(reads[0].commitRef, "HEAD~1");
+  assert.equal(view.fixed, true);
+  assert.equal(view.commitOid, "commit-a");
+  view.refresh(cx);
+  await drain();
+  assert.equal(reads.at(-1).commitRef, "commit-a", "a moving ref cannot silently change the commit on refresh");
+  view.intent = null;
+  view.commitInput.set_value("HEAD");
+  view.applySource("commit", cx);
+  await drain();
+  assert.equal(reads.at(-1).commitRef, "HEAD", "Show explicitly resolves the input again");
+  view.rootInput.set_value("/another/checkout");
+  view.changeRoot(cx);
+  await drain();
+  assert.equal(reads.at(-1).commitRef, "HEAD", "a different checkout resolves its own commit, not the old checkout's SHA");
+});
+
+test("switching to a commit waits for the draft save and keeps the source on failure", async () => {
+  const gate = deferred(), reads = [];
+  const { view, cx, drain } = await modules({ client: {
+    saveDraft: () => gate.promise,
+    review: async context => { reads.push(context); return { ...review(), commitOid: "commit-a" }; },
+  } });
+  view.commitInput.set_value("HEAD~2");
+  view.applySource("commit", cx);
+  await settle();
+  assert.equal(view.source, "uncommitted");
+  gate.reject(new Error("save failed"));
+  await drain();
+  assert.equal(view.source, "uncommitted");
+  assert.equal(reads.length, 0);
+  assert.equal(view.composer.value(), "Human question");
+  view.client.saveDraft = async () => ({});
+  view.applySource("commit", cx);
+  await drain();
+  assert.equal(view.source, "commit");
+  assert.equal(reads[0].commitRef, "HEAD~2");
+});
+
+test("the client carries a commit through reads, viewed writes and durable comment receipts", async () => {
+  const { load } = await modules();
+  const { ReviewClient } = (await load(path.join(root, "mods/Codewalker/client.js"))).namespace;
+  const calls = [], writes = [];
+  let revision = 1;
+  const client = new ReviewClient({ helper: "/helper.py", execute: async (_command, args) => {
+    calls.push(args);
+    let data;
+    if (args.includes("review")) data = { context: { repoRoot: "/checkout", reviewId: "review-a", revision },
+      scope: "commit", commitOid: "commit-a", snapshotId: "snap-a", files: [{ path: "historical.txt", status: "modified", viewed: false, diffFingerprint: "diff-a" }],
+      file: { path: "historical.txt", diffFingerprint: "diff-a", hunks: [] }, threads: [], drafts: [] };
+    else { const payload = JSON.parse(args[args.indexOf("--data") + 1]); writes.push(payload); data = { reviewId: "review-a", revision: ++revision }; }
+    return { code: 0, stdout: JSON.stringify({ ok: true, protocolVersion: 1, data }) };
+  } });
+  const context = { root: "/checkout", reviewId: "review-a", revision, source: "commit", commitRef: "commit-a", baseRef: "unrelated-branch-base" };
+  // A previous comparison lacked this file. It must not trigger a retained-file fallback here.
+  client.latest = { context: { reviewId: "review-a" }, scope: "uncommitted", files: [] };
+  const result = await client.review(context, "historical.txt");
+  assert.equal(calls[0].includes("--file"), true);
+  assert.equal(calls[0][calls[0].indexOf("--commit") + 1], "commit-a");
+  assert.equal(calls[0].includes("--base"), false);
+  assert.equal(result.detail.diffFingerprint, "diff-a");
+  assert.equal(result.commitOid, "commit-a");
+  await client.setFileViewed(context, "historical.txt", "diff-a", true);
+  await client.submit(context, { id: "draft-a", path: "historical.txt", snapshotId: "snap-a", anchor: { side: "new", startLine: 1, endLine: 1 } }, "Historical question", "post-a");
+  assert.equal(writes[0].commit, "commit-a");
+  assert.equal(writes[1].target.pendingPost.payload.commit, "commit-a", "the persisted receipt survives a moving ref or restart");
+  assert.equal(writes[2].commit, "commit-a");
+  assert.equal(writes[2].base, undefined);
+
+  const model = (await load(path.join(root, "mods/Codewalker/model.js"))).namespace;
+  const historical = unsentThread({ anchor: { side: "new", startLine: 1, endLine: 1, commitOid: "commit-a" } });
+  const sent = model.sendText({ items: model.sendable([historical]), root: "/checkout", helper: "/helper.py" });
+  assert.match(sent, /Historical commit commit-a; inspect the current code/);
+});
+
+test("returning to a mode restores its selected diff immediately and refreshes without blanking it", async () => {
+  const reads = [], gate = deferred();
+  const detail = (path, text) => ({ path, diffFingerprint: text, rows: [{ kind: "+", newLine: 1, text }] });
+  const { view, cx, drain } = await modules({ client: { review: async context => {
+    reads.push(context);
+    if (context.source === "uncommitted") return gate.promise;
+    return { ...review(), snapshotId: "branch-snapshot", baseRef: "main", files: [{ path: "branch.txt" }], detail: detail("branch.txt", "branch") };
+  } } });
+  view.intent = null;
+  view.composer.set_value("");
+  view.apply({ ...review(), files: [{ path: "a.txt", diffFingerprint: "original", viewed: true }], detail: detail("a.txt", "original") }, {}, cx);
+  view.page = 2;
+  view.baseInput.set_value("main");
+  view.applySource("branch", cx);
+  await drain();
+  view.applySource("uncommitted", cx);
+  assert.equal(view.file, "a.txt");
+  assert.equal(view.rows[0]?.text, "original", "the diff is available in the switch callback, before any helper response");
+  assert.equal(view.rowsSnapshot, "snapshot-b");
+  assert.equal(view.rowsFingerprint, "original");
+  assert.equal(view.files[0].viewed, true);
+  assert.equal(view.page, 2);
+  assert.equal(view.loading, false);
+  await settle();
+  assert.equal(reads.at(-1).source, "uncommitted");
+  gate.resolve({ ...review(), snapshotId: "edited", files: [{ path: "a.txt", diffFingerprint: "edited", viewed: false }], detail: detail("a.txt", "edited") });
+  await drain();
+  assert.equal(view.rows[0].text, "edited");
+  assert.equal(view.rowsSnapshot, "edited");
+  assert.equal(view.files[0].viewed, false);
+});
+
+test("commit mode restores the pinned SHA, while Show re-resolves without clearing its old diff", async () => {
+  const reads = [];
+  let nextOid = "commit-a";
+  const { view, cx, drain } = await modules({ client: { review: async context => {
+    reads.push(context);
+    const oid = context.commitRef === "HEAD" ? nextOid : context.commitRef;
+    return { ...review(), snapshotId: context.source === "commit" ? oid : "working", commitOid: oid, parentCount: 1,
+      files: [{ path: "a.txt" }], detail: { path: "a.txt", rows: [{ kind: "+", newLine: 1, text: oid ?? "working" }] } };
+  } } });
+  view.intent = null;
+  view.commitInput.set_value("HEAD");
+  view.applySource("commit", cx);
+  await drain();
+  view.applySource("uncommitted", cx);
+  await drain();
+  nextOid = "commit-b";
+  view.applySource("commit", cx, { resolveCommit: false });
+  assert.equal(view.commitOid, "commit-a");
+  assert.equal(view.rows[0].text, "commit-a");
+  assert.equal(view.loading, false);
+  await drain();
+  assert.equal(reads.at(-1).commitRef, "commit-a", "mode switching is navigation, not an implicit Show");
+  view.applySource("commit", cx);
+  assert.equal(view.rows[0].text, "commit-a", "Show retains the identified old commit until its replacement is ready");
+  await drain();
+  assert.equal(reads.at(-1).commitRef, "HEAD");
+  assert.equal(view.commitOid, "commit-b");
+  assert.equal(view.rows[0].text, "commit-b");
+});
+
+test("cached mode failures keep the diff readable but cannot send stale comments or change viewed marks", async () => {
+  let fail = false, writes = 0;
+  const { view, cx, drain } = await modules({ client: {
+    review: async () => {
+      if (fail) throw new Error("checkout unavailable");
+      return { ...review(), files: [{ path: "a.txt", diffFingerprint: "fp" }],
+        detail: { path: "a.txt", diffFingerprint: "fp", rows: [{ kind: "+", newLine: 1, text: "code" }] }, threads: [unsentThread()] };
+    },
+    deliver: async () => { writes++; }, setFileViewed: async () => { writes++; }, setStatus: async () => { writes++; },
+  } });
+  view.intent = null;
+  view.refresh(cx);
+  await drain();
+  view.baseInput.set_value("main");
+  view.applySource("branch", cx);
+  await drain();
+  fail = true;
+  view.applySource("uncommitted", cx);
+  view.target = () => ({ address: "t1", status: "idle" });
+  view.send(cx);
+  view.setViewed(true, cx);
+  view.setStatus(view.threads[0], cx);
+  view.begin({ side: "new", startLine: 1, endLine: 1 }, cx);
+  await drain();
+  assert.equal(writes, 0);
+  assert.equal(view.intent, null);
+  assert.equal(view.canAnchor(), false);
+  assert.equal(view.rows[0].text, "code");
+  assert.match(view.error, /last loaded comparison.*checkout unavailable/);
+  fail = false;
+  view.refresh(cx);
+  await drain();
+  assert.equal(view.canAnchor(), true);
+  assert.equal(view.error, null);
+});
+
+test("late responses cannot overwrite a restored mode, and another ref or checkout never borrows its cache", async () => {
+  const pending = [], reads = [];
+  const { view, cx, drain } = await modules({ client: { review: context => {
+    reads.push(context);
+    const gate = deferred(); pending.push(gate); return gate.promise;
+  } } });
+  const result = (text, extra = {}) => ({ ...review(), ...extra, files: [{ path: "a.txt" }], detail: { path: "a.txt", rows: [{ kind: "+", text }] } });
+  view.intent = null;
+  view.apply(result("working"), {}, cx);
+  view.baseInput.set_value("main");
+  view.applySource("branch", cx);
+  await settle();
+  pending[0].resolve(result("main"));
+  await drain();
+  view.applySource("uncommitted", cx);
+  await settle();
+  view.applySource("branch", cx);
+  assert.equal(view.rows[0].text, "main");
+  await settle();
+  pending[1].resolve(result("late working"));
+  await settle();
+  assert.equal(view.rows[0].text, "main");
+  pending[2].resolve(result("updated main"));
+  await drain();
+  assert.equal(view.rows[0].text, "updated main");
+  view.baseInput.set_value("release");
+  view.applySource("branch", cx);
+  assert.equal(view.rows.length, 0, "main's rows must not be labelled as release");
+  await settle();
+  pending[3].resolve(result("release", { baseRef: "release" }));
+  await drain();
+  view.rootInput.set_value("/other");
+  view.changeRoot(cx);
+  assert.equal(view.rows.length, 0, "another checkout never uses cached local content");
+  await settle();
+  pending[4].resolve(result("other", { root: "/other", reviewId: "other-review" }));
+  await drain();
+  view.applySource("uncommitted", cx);
+  assert.equal(view.rows.length, 0, "changing checkout also drops inactive modes");
+  await settle();
+  assert.equal(reads.at(-1).root, "/other");
+  pending[5].resolve(result("other working", { root: "/other", reviewId: "other-review" }));
+  await drain();
+});
+
+test("returning to an empty comparison keeps the loaded empty state during refresh", async () => {
+  const gate = deferred();
+  let hold = false;
+  const { view, cx, drain } = await modules({ client: { review: () => hold ? gate.promise : Promise.resolve(review()) } });
+  view.intent = null;
+  view.file = null;
+  view.apply(review(), {}, cx);
+  view.baseInput.set_value("main");
+  view.applySource("branch", cx);
+  await drain();
+  hold = true;
+  view.applySource("uncommitted", cx);
+  assert.equal(view.root, "/checkout");
+  assert.equal(view.file, null);
+  assert.equal(view.files.length, 0);
+  assert.equal(view.loading, false);
+  gate.resolve(review());
+  await drain();
+});

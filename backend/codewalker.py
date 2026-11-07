@@ -195,8 +195,28 @@ class Git:
                     return candidate, merge_base
         fail("invalid_base", "base does not resolve to a commit with a common ancestor", base=base)
 
-    def changes(self, base_oid):
-        tokens = self.run(self.DIFF + ["--raw", "-z", "--no-abbrev", base_oid, "--"]).stdout.split(b"\0")
+    def commit_endpoints(self, commit):
+        ref = text(commit, "commit", 1024)
+        if ref.startswith("-"):
+            fail("invalid_commit", "commit must be a Git revision, not an option")
+        oid = self.line(["rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}"], optional=True)
+        if not oid:
+            fail("invalid_commit", "commit does not resolve to a local commit", commit=ref)
+        # Read the actual parent headers: rev-list hides parents at shallow
+        # boundaries, which must not be mistaken for root commits.
+        header = self.run(["cat-file", "-p", oid]).stdout.split(b"\n\n", 1)[0]
+        parents = [line.split()[1].decode("ascii") for line in header.split(b"\n") if line.startswith(b"parent ")]
+        if parents:
+            parent = parents[0]
+            if self.run(["cat-file", "-e", parent + "^{commit}"], check=False).returncode:
+                fail("invalid_commit", "the commit's first parent is unavailable locally; fetch its history first", commit=oid)
+        else:
+            parent = self.line(["hash-object", "-t", "tree", "--stdin"])
+        return oid, parent, len(parents)
+
+    def changes(self, base_oid, target_oid=None):
+        revisions = [base_oid] + ([target_oid] if target_oid else [])
+        tokens = self.run(self.DIFF + ["--raw", "-z", "--no-abbrev", *revisions, "--"]).stdout.split(b"\0")
         entries = []
         i = 0
         statuses = {"A": "added", "M": "modified", "D": "deleted", "R": "renamed",
@@ -206,7 +226,7 @@ class Git:
             i += 1
             if len(header) != 5 or not header[0].startswith(":") or i >= len(tokens):
                 fail("git_error", "invalid Git raw change record")
-            mode_old, mode_new, old_oid, _, status_code = header
+            mode_old, mode_new, old_oid, new_oid, status_code = header
             first = os.fsdecode(tokens[i])
             i += 1
             old_path = None
@@ -215,8 +235,8 @@ class Git:
                 i += 1
             entries.append({"path": first, "oldPath": old_path,
                             "status": statuses.get(status_code[0], "typechanged"),
-                            "oldMode": mode_old[1:], "newMode": mode_new, "oldOid": old_oid})
-        untracked = self.run(["ls-files", "--others", "--exclude-standard", "-z"]).stdout.split(b"\0")
+                            "oldMode": mode_old[1:], "newMode": mode_new, "oldOid": old_oid, "newOid": new_oid})
+        untracked = [] if target_oid else self.run(["ls-files", "--others", "--exclude-standard", "-z"]).stdout.split(b"\0")
         known = {e["path"] for e in entries}
         for path in untracked:
             if path and os.fsdecode(path) not in known:
@@ -224,7 +244,7 @@ class Git:
                                 "oldMode": "000000", "newMode": "100644", "oldOid": ""})
         if len(entries) > MAX_FILES:
             fail("too_large", f"review exceeds {MAX_FILES} changed files")
-        counts = self.run(self.DIFF + ["--numstat", "-z", base_oid, "--"]).stdout.split(b"\0")
+        counts = self.run(self.DIFF + ["--numstat", "-z", *revisions, "--"]).stdout.split(b"\0")
         by_path = {}
         i = 0
         while i < len(counts) and counts[i]:
@@ -292,15 +312,25 @@ class Git:
         finally:
             os.close(fd)
 
-    def snapshot(self, scope="uncommitted", base=None, selected=None, select_first=False):
+    def snapshot(self, scope="uncommitted", base=None, selected=None, select_first=False, commit=None):
         try:
-            return self._snapshot(scope, base, selected, select_first)
+            return self._snapshot(scope, base, selected, select_first, commit)
         finally:
             self.close()
 
-    def _snapshot(self, scope, base, selected, select_first):
-        base_ref, base_oid = self.endpoints(scope, base)
-        entries = self.changes(base_oid)
+    def _snapshot(self, scope, base, selected, select_first, commit):
+        target_oid = None
+        parent_count = None
+        if scope == "commit":
+            if base is not None:
+                fail("invalid_request", "commit scope uses --commit, not --base")
+            target_oid, base_oid, parent_count = self.commit_endpoints(commit)
+            base_ref = base_oid if parent_count else "(empty tree)"
+        else:
+            if commit is not None:
+                fail("invalid_request", "--commit requires commit scope")
+            base_ref, base_oid = self.endpoints(scope, base)
+        entries = self.changes(base_oid, target_oid)
         contents = {}
         consumed = 0
         no_op_paths = set()
@@ -322,6 +352,9 @@ class Git:
                     old = self.blob(entry["oldOid"])
             if entry["status"] == "deleted":
                 new, new_mark = b"", digest(b"")
+            elif target_oid:
+                new = self.blob(entry["newOid"]) if entry["newMode"] in ("100644", "100755") else None
+                new_mark = digest(new) if new is not None else entry["newOid"]
             else:
                 new, new_mark = self.disk(path)
             old_mark = digest(old) if old is not None else entry["oldOid"]
@@ -332,7 +365,8 @@ class Git:
                 continue
             consumed += len(old or b"") + len(new or b"")
             too_large = (old is None and entry["oldMode"] in ("100644", "100755")) or (
-                new is None and isinstance(new_mark, list) and new_mark[0] == "large")
+                new is None and ((target_oid and entry["newMode"] in ("100644", "100755"))
+                                 or (isinstance(new_mark, list) and new_mark[0] == "large")))
             aggregate_limit = consumed > MAX_TOTAL_BYTES
             if aggregate_limit:
                 too_large = True
@@ -369,14 +403,16 @@ class Git:
                 entry["oldMode"], entry["newMode"], old_mark, new_mark,
             ]) if isinstance(old_mark, str) and isinstance(new_mark, str)
                 and not entry.get("unsupported") else None)
-        snapshot_id = "snapshot_" + digest([scope, base_oid, self.head, [
+        snapshot_id = "snapshot_" + digest([scope, base_oid, target_oid or self.head, [
             [e["path"], e["oldPath"], e["status"], e["oldMode"], e["newMode"],
              contents[e["path"]][2], contents[e["path"]][3]] for e in entries]])
         result = {"scope": scope, "baseRef": base_ref, "baseOid": base_oid,
-                  "headOid": self.head, "snapshotId": snapshot_id, "files": entries,
+                  "headOid": target_oid or self.head, "snapshotId": snapshot_id, "files": entries,
                   "file": None,
                   "warnings": ([f"Aggregate text budget ({MAX_TOTAL_BYTES:,} bytes) reached; remaining changes are metadata-only and existing discussion evidence is retained."]
                                if any(e.get("aggregateLimit") for e in entries) else [])}
+        if target_oid:
+            result.update(commitOid=target_oid, parentCount=parent_count)
         if selected is None and select_first and entries:
             # One call opens a review: the list plus the first changed file's hunks.
             selected = entries[0]["path"]
@@ -385,10 +421,10 @@ class Git:
             entry = next((e for e in entries if e["path"] == selected), None)
             if entry is None:
                 fail("not_found", "file is not in the selected diff", path=selected)
-            result["file"] = self.file_diff(entry, base_oid, contents[selected], snapshot_id)
+            result["file"] = self.file_diff(entry, base_oid, contents[selected], snapshot_id, target_oid)
         return result, contents
 
-    def file_diff(self, entry, base_oid, content, snapshot_id):
+    def file_diff(self, entry, base_oid, content, snapshot_id, target_oid=None):
         result = {"path": entry["path"], "diffFingerprint": entry["diffFingerprint"], "binary": entry["binary"],
                   "tooLarge": entry["tooLarge"], "unsupported": entry.get("unsupported", False), "hunks": []}
         if result["binary"] or result["tooLarge"] or result["unsupported"]:
@@ -404,7 +440,7 @@ class Git:
             return result
         paths = ([entry["oldPath"]] if entry["oldPath"] else []) + [entry["path"]]
         # Literal pathspecs prevent filenames containing [], *, ? from matching other files.
-        raw = self.run(["--literal-pathspecs"] + self.DIFF + ["--unified=3", base_oid, "--"] + paths).stdout
+        raw = self.run(["--literal-pathspecs"] + self.DIFF + ["--unified=3", base_oid] + ([target_oid] if target_oid else []) + ["--"] + paths).stdout
         hunk = None
         old_line = new_line = 0
         for line in raw.decode("utf-8", "replace").split("\n"):
@@ -564,6 +600,7 @@ class Store:
         if source is not None:
             entry = next((e for e in source["files"] if e["path"] == anchor["path"]), None)
             if (entry and source["scope"] == anchor["scope"] and source["baseOid"] == anchor["baseOid"]
+                    and source.get("commitOid") == anchor.get("commitOid")
                     and contents and anchor["path"] in contents):
                 raw = contents[anchor["path"]][0 if anchor["side"] == "old" else 1]
                 current = (raw is not None and digest(raw) == anchor["fingerprint"]
@@ -593,7 +630,7 @@ class Store:
                           "SELECT id FROM threads WHERE review_id=? ORDER BY created_at,id", (self.git.review_id,))],
                       "viewedFiles": {row["path"]: row["fingerprint"] for row in self.db.execute(
                           "SELECT path,fingerprint FROM file_views WHERE review_id=? AND scope=? AND base_ref=?",
-                          (self.git.review_id, source["scope"], source["baseRef"]))},
+                          (self.git.review_id, source["scope"], source.get("commitOid") or source["baseRef"]))},
                       "drafts": [self.draft(row) for row in self.db.execute(
                           "SELECT * FROM drafts WHERE review_id=? ORDER BY updated_at,id", (self.git.review_id,))]}
             current = {entry["path"]: entry["diffFingerprint"] for entry in source["files"]}
@@ -609,10 +646,10 @@ class Store:
         if not isinstance(data, dict):
             fail("invalid_request", "--data must be one JSON object")
         allowed = {"commandId", "reviewId", "expectedRevision", "actor"} | {
-            "create": {"scope", "base", "anchor", "body", "replyRequested"}, "reply": {"threadId", "body", "replyRequested"},
+            "create": {"scope", "base", "commit", "anchor", "body", "replyRequested"}, "reply": {"threadId", "body", "replyRequested"},
             "resolve": {"threadId", "resolved"}, "edit": {"messageId", "body"}, "delete": {"messageId"}, "deliver": {"messageIds", "state", "target"}, "draft-save": {"draftId", "body", "target"},
             "draft-delete": {"draftId"},
-            "file-view": {"scope", "base", "path", "diffFingerprint", "viewed"}}[operation]
+            "file-view": {"scope", "base", "commit", "path", "diffFingerprint", "viewed"}}[operation]
         if set(data) - allowed:
             fail("invalid_request", "unknown mutation fields", fields=sorted(set(data) - allowed))
         command_id = text(data.get("commandId"), "commandId", 256)
@@ -651,7 +688,7 @@ class Store:
                 end = positive(given["endLine"], "endLine")
                 if end < start:
                     fail("invalid_request", "endLine must not precede startLine")
-                source, contents = self.git.snapshot(data.get("scope", "uncommitted"), data.get("base"), path)
+                source, contents = self.git.snapshot(data.get("scope", "uncommitted"), data.get("base"), path, commit=data.get("commit"))
                 if given["snapshotId"] != source["snapshotId"]:
                     fail("snapshot_conflict", "diff changed; refresh before creating an annotation", snapshotId=source["snapshotId"])
                 if source["file"]["binary"] or source["file"]["tooLarge"] or source["file"]["unsupported"]:
@@ -667,6 +704,8 @@ class Store:
                               baseOid=source["baseOid"], headOid=source["headOid"], fingerprint=digest(raw),
                               fileFingerprint=digest(contents[path][2:]),
                               snippet="\n".join(lines[start - 1:end]))
+                if source.get("commitOid"):
+                    anchor["commitOid"] = source["commitOid"]
                 thread_id = identifier("thread")
                 self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?)", (thread_id, self.git.review_id, "open", canonical_json(anchor), timestamp, timestamp))
                 self.add_message(thread_id, actor, body, timestamp, requested)
@@ -676,7 +715,7 @@ class Store:
                 if type(data.get("viewed")) is not bool:
                     fail("invalid_request", "viewed must be true or false")
                 given = text(data.get("diffFingerprint"), "diffFingerprint")
-                source, _ = self.git.snapshot(data.get("scope", "uncommitted"), data.get("base"))
+                source, _ = self.git.snapshot(data.get("scope", "uncommitted"), data.get("base"), commit=data.get("commit"))
                 entry = next((e for e in source["files"] if e["path"] == path), None)
                 if entry is None:
                     fail("not_found", "file is not in the selected diff", path=path)
@@ -684,13 +723,14 @@ class Store:
                     fail("invalid_request", "this file has no reliable content fingerprint")
                 if given != entry["diffFingerprint"]:
                     fail("snapshot_conflict", "this file changed; refresh before marking it viewed")
-                key = (self.git.review_id, source["scope"], source["baseRef"], path)
+                key = (self.git.review_id, source["scope"], source.get("commitOid") or source["baseRef"], path)
                 if data["viewed"]:
                     self.db.execute("INSERT OR REPLACE INTO file_views VALUES(?,?,?,?,?)", (*key, given))
                 else:
                     self.db.execute("DELETE FROM file_views WHERE review_id=? AND scope=? AND base_ref=? AND path=?", key)
                 result["fileView"] = {"path": path, "diffFingerprint": given, "viewed": data["viewed"],
-                                      "scope": source["scope"], "baseRef": source["baseRef"]}
+                                      "scope": source["scope"], "baseRef": source["baseRef"],
+                                      **({"commitOid": source["commitOid"]} if source.get("commitOid") else {})}
             elif operation == "deliver":
                 ids = data.get("messageIds")
                 if not isinstance(ids, list) or not ids or len(ids) > 1000 or len(set(map(str, ids))) != len(ids):
@@ -748,7 +788,9 @@ class Store:
                 self.db.execute("UPDATE threads SET updated_at=? WHERE id=?", (timestamp, thread_id))
                 source = contents = None
                 try:
-                    source, contents = self.git.snapshot(thread["anchor"]["scope"], thread["anchor"]["baseRef"])
+                    source, contents = self.git.snapshot(thread["anchor"]["scope"],
+                        None if thread["anchor"].get("commitOid") else thread["anchor"]["baseRef"],
+                        commit=thread["anchor"].get("commitOid"))
                 except Failure:
                     pass  # A missing old base cannot prevent a reply to its durable discussion.
                 result["thread"] = self.thread(thread_id, source, contents)
@@ -806,6 +848,8 @@ def export_text(listing):
         anchor = thread["anchor"]
         awaiting = "; short reply requested" if thread["awaitingReply"] else ""
         blocks.append(f"{anchor['path']}:{anchor['startLine']}-{anchor['endLine']} ({anchor['side']}) [{thread['status']}; {anchor['validity']}{awaiting}] {thread['id']}\n{anchor['snippet']}")
+        if anchor.get("commitOid"):
+            blocks.append(f"Historical commit {anchor['commitOid']}; inspect the current code before making changes.")
         blocks.extend(f"{message['actor']['name']} ({message['actor']['kind']}):\n{message['body']}" for message in thread["messages"])
     return "\n\n".join(blocks)
 
@@ -833,6 +877,8 @@ Each command prints one JSON value: {{"ok": true, "data": ...}}, or
   before you act.
 - For other threads, act on the comment. Reply in the thread only when you have a
   question, you disagree, or you cannot do it.
+- Historical commit comments refer to that commit, not necessarily the current
+  working tree. Inspect the current code before making changes.
 - Reply by thread ID. Do not open a new thread to answer.
 - The reviewer resolves threads. Resolve one only when they ask you to.
 - Change only your own messages. Never edit the SQLite store.
@@ -906,12 +952,30 @@ def skill_text(repo):
                         helper_r=repr(helper), repo_r=repr(shown))
 
 
-def open_review(repo):
+def open_review(repo, scope="uncommitted", base=None, commit=None):
     """Open Review as a pane right of this terminal's pane, for its folder."""
     terminal = os.environ.get("HC_TERMINAL_ID")
     if not terminal:
         fail("not_in_herdr", "Run open in a Herdr terminal (HC_TERMINAL_ID is not set)")
+    if "/" in terminal:
+        fail("invalid_request", "open supports local Herdr terminals only")
     folder = os.path.abspath(repo or os.getcwd())
+    if scope != "commit" and commit is not None:
+        fail("invalid_request", "--commit requires commit scope")
+    review_props = {"framed": True, "folder": folder, "scope": scope}
+    if scope == "commit":
+        if base is not None:
+            fail("invalid_request", "commit scope uses --commit, not --base")
+        # Resolve before opening a pane. A bad ref never changes the layout.
+        git = Git(folder)
+        commit, _, _ = git.commit_endpoints(commit)
+        folder = str(git.root)
+        review_props.update(folder=folder, commit=commit)
+    elif scope == "branch":
+        git = Git(folder)
+        base, _ = git.endpoints(scope, base)
+        folder = str(git.root)
+        review_props.update(folder=folder, base=base)
 
     def herdr(*argv):
         try:
@@ -932,9 +996,10 @@ def open_review(repo):
              for t in tab.get("terminals", []) if t.get("terminal") == terminal]
     if not panes or not panes[0]:
         fail("herdr_error", f"terminal {terminal} has no pane; show it first")
-    split = {"direction": "right", "pane": panes[0], "mod": "Codewalker", "props": {"framed": True, "folder": folder}}
-    herdr("do", "pane.split", json.dumps(split))
-    return {"pane": panes[0], "folder": folder}
+    split = {"direction": "right", "pane": panes[0], "mod": "Codewalker", "props": review_props}
+    opened = herdr("do", "pane.split", json.dumps(split))
+    return {"pane": opened.get("pane"), "folder": folder, "scope": scope,
+            **({"commitOid": commit} if scope == "commit" else {})}
 
 
 class Parser(argparse.ArgumentParser):
@@ -948,8 +1013,9 @@ def parse_args(argv):
     parser.add_argument("--store")
     parser.add_argument("command", choices=["skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete"])
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch"])
+    parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch", "commit"])
     parser.add_argument("--base")
+    parser.add_argument("--commit")
     parser.add_argument("--file")
     parser.add_argument("--select-first", action="store_true")
     parser.add_argument("--data")
@@ -968,13 +1034,13 @@ def execute(args):
             if args.select_first and (args.command != "review" or args.file is not None):
                 fail("invalid_request", "--select-first is only for review without --file")
             source, contents = git.snapshot(args.scope, args.base, args.file if args.command == "review" else None,
-                                            args.select_first)
+                                            args.select_first, args.commit)
             listing = store.listing(source, contents)
             if args.command == "review":
                 context = store.context()
                 context["revision"] = listing["revision"]
                 # Internal old blob/mode fields are not protocol surface.
-                files = [dict({k: v for k, v in entry.items() if k not in ("oldMode", "newMode", "oldOid")},
+                files = [dict({k: v for k, v in entry.items() if k not in ("oldMode", "newMode", "oldOid", "newOid")},
                               viewed=bool(entry["diffFingerprint"] and listing["viewedFiles"].get(entry["path"]) == entry["diffFingerprint"]))
                          for entry in source["files"]]
                 return dict(source, context=context, files=files, threads=listing["threads"], drafts=listing["drafts"])
@@ -1001,7 +1067,7 @@ def main(argv=None):
             # Plain Markdown for an agent to read, not a JSON result.
             print(skill_text(args.repo), end="")
             return 0
-        data = open_review(args.repo) if args.command == "open" else execute(args)
+        data = open_review(args.repo, args.scope, args.base, args.commit) if args.command == "open" else execute(args)
         result = {"ok": True, "protocolVersion": VERSION, "data": data}
         encoded = json.dumps(result, ensure_ascii=False)
         if len(encoded.encode("utf-8")) > MAX_OUTPUT:

@@ -1,6 +1,6 @@
 # Codewalker
 
-Native code review for Herdr: uncommitted and branch diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
+Native code review for Herdr: uncommitted, branch and single-commit diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
 
 ## Requirements and boundaries
 
@@ -8,6 +8,7 @@ Native code review for Herdr: uncommitted and branch diffs, old/new line discuss
 - Python 3.10+ standard library and Git. No npm runtime, database server, network service, API key, or downloaded helper.
 - Local checkouts only. A remote space is rejected before local execution; no accidental same-path local fallback.
 - Branch review compares the selected local base's **merge-base → working tree**, including committed and uncommitted changes. No automatic fetch.
+- Commit review compares **first parent → selected commit**, or empty tree → root commit. Both sides come from Git objects; the index and working tree are excluded. Merge commits use their first parent, not a combined diff.
 - Review shows the folder of the pane it opened beside (or `--repo`); never the space's display name. The folder button’s tooltip shows the resolved checkout and branch. Confirm that root before commenting.
 
 ## Prepare and validate without changing your app
@@ -52,6 +53,37 @@ Add a key to your `keys.json` yourself; the installer doesn't edit it:
 
 The key opens Review as a pane right of the focused pane, for that pane's folder. Press it again in the same tab to close it. In a terminal, `python3 ~/.config/herdr-app/mods/Codewalker/backend.py open` does the same for that terminal (`--repo` for another checkout). The command palette can't list mod commands, so it has no Review entry.
 
+### Open a specific comparison from another mod
+
+Use Herdr's `pane.split` with an explicit target pane and Codewalker's public props. This opens a new review; it does not toggle or replace an existing review or its draft.
+
+```js
+import { run } from "herdr";
+
+run("pane.split", {
+  direction: "right",
+  pane: targetPaneId,
+  mod: "Codewalker",
+  props: {
+    framed: true,
+    folder: "/absolute/local/checkout",
+    scope: "commit",
+    commit: "abc1234", // full/short SHA, tag, or ref such as HEAD~1
+  },
+});
+```
+
+`scope` defaults to `"uncommitted"`. `"branch"` accepts `base`; `"commit"` requires `commit`. These props also work in a layout block. Use an explicit `folder` to pin the checkout; remote execution remains unsupported. Bare `mod.open Codewalker` remains the existing key toggle and cannot take comparison arguments.
+
+From a local Herdr terminal:
+
+```sh
+python3 ~/.config/herdr-app/mods/Codewalker/backend.py open \
+  --repo /absolute/local/checkout --scope commit --commit HEAD~1
+```
+
+`open` validates and resolves the commit before opening a pane, passes its full SHA, and returns the **new** pane ID, folder, scope and `commitOid`. To get data without opening UI, use `review --scope commit --commit <ref> --json`. See [`docs/protocol.md`](docs/protocol.md).
+
 ### Review in the side panel (your own layout)
 
 Codewalker ships no layout. In a layout you own (a copy of `main`), it can also sit in the side panel, opened by a **Review** button beside the tab bar, like Files and Changes:
@@ -76,7 +108,7 @@ The button adds `"review"` to the shared `workspace.panels` list, so the tab bar
 ## Review flow
 
 1. Open Review (see above). It shows the checkout of the pane it opened beside. Drag the pane edge to widen it: below 760 px the changed files sit above the diff, wider they sit side by side. To review another local checkout, choose the folder button beside the scope controls, enter its absolute path and choose **Open**. There is no folder/file browser.
-2. Choose **Uncommitted**, or choose **Branch**, enter a local base ref and choose **Compare**. Scope tooltips explain the comparison and show the resolved merge base.
+2. Choose **Uncommitted**, **Branch** (enter a local base ref and choose **Compare**), or **Commit** (enter a SHA/ref such as `HEAD~1` and choose **Show**). Returning to a loaded mode shows its last diff immediately and refreshes in the background. Commit mode displays the resolved short SHA and stays pinned to it on refresh and mode switches. **Show** resolves the input again. Scope tooltips explain the comparisons.
 3. Select a changed path. Hover a line and press its **+**, or press an **old or new line number**. Drag across line numbers to select a range on one side; a range stays inside the hunk where it started. Shift-click extends an open comment's range.
 4. Write a multiline message and choose **Comment** / **Reply** (⌘/Ctrl+Enter). Choose **Edit** on your own message to change it in place (⌘/Ctrl+Enter saves, Esc cancels); it shows as edited and the store keeps the earlier text. **Delete** asks first; deleting your comment removes its whole thread, replies included, while deleting a reply removes only that reply. Check **Ask for a short reply** to have the agent answer in the thread in a few sentences, then go on with its work; the thread shows **Awaiting reply** until someone answers. Messages show Human/Agent attribution. Resolve/Reopen preserves all replies; resolved discussions fold to one line until shown.
 5. The 💬 button beside the scope controls (between Refresh and the folder button; the open count is in its tooltip and, when wide, its label) shows **Discussions**: every thread grouped by file, its code, the first comment and replies indented below. Filter by All, Open or Awaiting reply. **Show in diff** opens the file and starts the diff at the thread's hunk with its card marked; **Reply** does that and opens a reply. Esc or the button returns to the files.
@@ -87,7 +119,7 @@ The button adds `"review"` to the shared `workspace.panels` list, so the tab bar
 
 Check **Viewed** in the diff header when you finish a file. The file list shows a checkmark and **n of m viewed**; **Hide viewed** filters those rows, and **Show all** brings them back. Hiding the current file keeps its diff and draft open. Opening a file never marks it automatically.
 
-Marks survive restarts in the local SQLite store, separately for each checkout/branch, scope and base ref. They match that file's old/new content, paths, status and modes—not the whole review snapshot. Changes to that file make it unviewed again; unrelated commits, files and discussions do not. Returning to the exact marked version restores its mark. Files without reliable content fingerprints (such as oversized worktree files or symlinks) cannot be marked. This is a local checklist, not a GitHub viewed-state sync.
+Marks survive restarts in the local SQLite store, separately for each checkout/branch, scope and base ref (or full commit SHA in Commit mode). They match that file's old/new content, paths, status and modes—not the whole review snapshot. Changes to that file make it unviewed again; unrelated commits, files and discussions do not. Returning to the exact marked version restores its mark. Files without reliable content fingerprints (such as oversized worktree files or symlinks) cannot be marked. This is a local checklist, not a GitHub viewed-state sync.
 
 Drafts autosave after 300 ms and before navigation/posting. A save conflict keeps your text and shows an error; refresh and reconcile before retrying. Esc or the composer's close button removes the composer and keeps its saved text; **Discard** deletes the draft. Saved drafts can be restored from the navigator.
 

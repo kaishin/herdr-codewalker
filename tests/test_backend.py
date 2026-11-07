@@ -58,6 +58,8 @@ class BackendTests(unittest.TestCase):
         data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": actor,
                 "scope": review["scope"], "anchor": {"path": "a.txt", "side": "new", "startLine": 2,
                 "endLine": 2, "snapshotId": review["snapshotId"]}, "body": body}
+        if review["scope"] == "commit":
+            data["commit"] = review["commitOid"]
         return self.cli("create", data=data), data
 
     def mark_file(self, review, path="a.txt", viewed=True, command="view1"):
@@ -65,6 +67,9 @@ class BackendTests(unittest.TestCase):
         data = {"commandId": command, "expectedRevision": review["context"]["revision"], "actor": HUMAN,
                 "scope": review["scope"], "base": review["baseRef"], "path": path,
                 "diffFingerprint": file["diffFingerprint"], "viewed": viewed}
+        if review["scope"] == "commit":
+            data.pop("base")
+            data["commit"] = review["commitOid"]
         return self.cli("file-view", data=data), data
 
     def test_viewed_marks_survive_restart_unrelated_changes_and_explicit_retries(self):
@@ -168,6 +173,130 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(review["files"][0]["viewed"])
         self.mark_file(review)
         self.assertTrue(self.cli("review")["files"][0]["viewed"])
+
+    def test_commit_review_reads_immutable_blobs_not_current_worktree_or_head(self):
+        self.changed()
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "selected change")
+        commit = self.git("rev-parse", "HEAD")
+        first = self.cli("review", "--scope", "commit", "--commit", commit[:12], "--file", "a.txt")
+        self.assertEqual(first["commitOid"], commit)
+        self.assertEqual(first["parentCount"], 1)
+        self.assertEqual(first["baseOid"], self.git("rev-parse", "HEAD^"))
+        (self.root / "a.txt").write_text("later committed content\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "later change")
+        (self.root / "a.txt").write_text("staged content\n")
+        self.git("add", "a.txt")
+        (self.root / "a.txt").unlink()
+        (self.root / "a.txt").symlink_to("/does/not/exist")
+        (self.root / "untracked").write_text("not in commit\n")
+        index = (self.root / ".git/index").read_bytes()
+        review = self.cli("review", "--scope", "commit", "--commit", commit, "--file", "a.txt")
+        self.assertEqual(review["snapshotId"], first["snapshotId"])
+        self.assertEqual(review["file"], first["file"])
+        self.assertEqual([f["path"] for f in review["files"]], ["a.txt"])
+        self.assertEqual(review["headOid"], commit)
+        self.assertNotEqual(review["context"]["headOid"], commit)
+        self.assertEqual((self.root / ".git/index").read_bytes(), index)
+        created, _ = self.create(review)
+        self.assertEqual(created["thread"]["anchor"]["snippet"], "TWO")
+        self.assertEqual(created["thread"]["anchor"]["commitOid"], commit)
+        self.assertEqual(created["thread"]["anchor"]["validity"], "current")
+        replied = self.cli("reply", data={"commandId": "historical-reply", "expectedRevision": 1,
+                           "actor": AGENT, "threadId": created["thread"]["id"], "body": "Historical reply"})
+        self.assertEqual(replied["thread"]["anchor"]["validity"], "current")
+        self.assertEqual(self.cli("list")["threads"][0]["anchor"]["validity"], "stale")
+
+    def test_commit_marks_and_anchors_are_scoped_to_the_exact_commit_not_its_diff(self):
+        self.changed()
+        self.git("add", ".")
+        tree = self.git("write-tree")
+        parent = self.git("rev-parse", "HEAD")
+        a = self.git("commit-tree", tree, "-p", parent, "-m", "A")
+        b = self.git("commit-tree", tree, "-p", parent, "-m", "B")
+        self.git("tag", "review-a", a)
+        review = self.cli("review", "--scope", "commit", "--commit", "review-a", "--file", "a.txt")
+        self.mark_file(review)
+        self.create(self.cli("review", "--scope", "commit", "--commit", a, "--file", "a.txt"))
+        another = self.cli("review", "--scope", "commit", "--commit", b, "--file", "a.txt")
+        self.assertEqual(another["file"]["diffFingerprint"], review["file"]["diffFingerprint"])
+        self.assertNotEqual(another["snapshotId"], review["snapshotId"])
+        self.assertFalse(another["files"][0]["viewed"])
+        self.assertEqual(another["threads"][0]["anchor"]["validity"], "stale")
+        again = self.cli("review", "--scope", "commit", "--commit", a)
+        self.assertTrue(again["files"][0]["viewed"])
+        self.assertEqual(again["threads"][0]["anchor"]["validity"], "current")
+
+    def test_root_empty_and_merge_commits_use_empty_tree_or_first_parent(self):
+        root = self.git("rev-parse", "HEAD")
+        result = self.cli("review", "--scope", "commit", "--commit", root, "--file", "a.txt")
+        self.assertEqual(result["parentCount"], 0)
+        self.assertEqual(result["baseRef"], "(empty tree)")
+        self.assertEqual({f["status"] for f in result["files"]}, {"added"})
+        self.assertEqual([r["text"] for r in result["file"]["hunks"][0]["rows"]], ["one", "two", "three"])
+        self.git("commit", "--allow-empty", "-qm", "empty")
+        empty = self.cli("review", "--scope", "commit", "--commit", "HEAD", "--select-first")
+        self.assertEqual(empty["files"], [])
+        self.assertIsNone(empty["file"])
+        self.git("switch", "-c", "side", root)
+        (self.root / "side.txt").write_text("side\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "side")
+        self.git("switch", "main")
+        (self.root / "main.txt").write_text("main\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "main")
+        parent = self.git("rev-parse", "HEAD")
+        self.git("merge", "--no-edit", "side")
+        merge = self.cli("review", "--scope", "commit", "--commit", "HEAD")
+        self.assertEqual(merge["parentCount"], 2)
+        self.assertEqual(merge["baseOid"], parent)
+        self.assertEqual([f["path"] for f in merge["files"]], ["side.txt"])
+
+    def test_commit_rejects_invalid_refs_and_missing_shallow_parents(self):
+        for ref in ("no-such-commit", "HEAD:a.txt", "HEAD..HEAD", "--help"):
+            with self.subTest(ref=ref):
+                self.cli("review", "--scope", "commit", "--commit=" + ref, error="invalid_commit")
+        self.cli("review", "--scope", "commit", error="invalid_request")
+        self.cli("review", "--commit", "HEAD", error="invalid_request")
+        self.cli("review", "--scope", "commit", "--commit", "HEAD", "--base", "main", error="invalid_request")
+        self.git("commit", "--allow-empty", "-qm", "shallow tip")
+        shallow = Path(self.temp.name) / "shallow"
+        self.git("clone", "--depth=1", self.root.as_uri(), str(shallow))
+        self.root = shallow
+        response = self.cli("review", "--scope", "commit", "--commit", "HEAD", error="invalid_commit")
+        self.assertIn("first parent is unavailable", response["error"]["message"])
+
+    def test_open_commit_passes_pinned_props_and_returns_the_created_pane(self):
+        # Fake only the app boundary. This test must never alter the user's window.
+        tool_dir = Path(self.temp.name) / "bin"
+        tool_dir.mkdir()
+        calls = Path(self.temp.name) / "calls.jsonl"
+        app = tool_dir / "herdr-app"
+        app.write_text(f"#!{sys.executable}\n" + "import json,sys\n"
+            + f"with open({str(calls)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + "print(json.dumps({'spaces':[{'tabs':[{'terminals':[{'terminal':'t-source','pane':'p-source'}]}]}]} if sys.argv[1] == 'ls' else {'pane':'p-created'}))\n")
+        app.chmod(0o755)
+        env = {**os.environ, "PATH": str(tool_dir) + os.pathsep + os.environ.get("PATH", ""), "HC_TERMINAL_ID": "t-source"}
+        argv = [sys.executable, str(HELPER), "open", "--repo", str(self.root), "--scope", "commit", "--commit", "HEAD"]
+        result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = json.loads(result.stdout)["data"]
+        commit = self.git("rev-parse", "HEAD")
+        self.assertEqual(result["pane"], "p-created")
+        self.assertEqual(result["commitOid"], commit)
+        sent = [json.loads(line) for line in calls.read_text().splitlines()]
+        split = json.loads(sent[1][2])
+        self.assertEqual(split["pane"], "p-source")
+        self.assertEqual(split["props"]["commit"], commit)
+        self.assertEqual(split["props"]["scope"], "commit")
+        self.assertEqual(split["props"]["folder"], str(self.root.resolve()))
+        calls.write_text("")
+        argv[-1] = "missing"
+        failed = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(failed.stdout)["error"]["code"], "invalid_commit")
+        self.assertEqual(calls.read_text(), "", "a bad commit cannot open a pane")
 
     def test_uncommitted_coordinates_untracked_and_index_are_read_only(self):
         (self.root / "a.txt").write_text("one\nstaged\nthree\n", encoding="utf-8")

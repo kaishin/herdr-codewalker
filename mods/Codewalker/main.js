@@ -7,6 +7,11 @@ import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, acto
 const stop = (_event, cx) => cx.stop_propagation();
 // Recently viewed diffs for the current snapshot only; bounded by files and rows.
 const CACHE_FILES = 24, CACHE_ROWS = 60_000;
+// One last comparison per scope, only for this checkout. Never cache an editor,
+// pending mutation or draft receipt. Cached discussions stay read-only until refreshed.
+const COMPARISON_FIELDS = ["root", "reviewId", "snapshotId", "revision", "branch", "resolvedBase",
+  "commitOid", "commitParents", "files", "threads", "note", "file", "rows", "fileNote",
+  "rowsSnapshot", "rowsFingerprint", "page", "from"];
 // Git's object/log writes never change a review; everything else may.
 const GIT_NOISE = /\/\.git\/(?:objects|logs)\//;
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -115,14 +120,19 @@ export default class Codewalker extends View {
     this.folder = p.folder ?? here?.folder ?? space?.folder ?? "";
     this.on = p.on ?? here?.on ?? space?.machine ?? null;
     this.askReply = false;
-    this.source = "uncommitted";
-    this.base = "";
+    // Public pane/layout props: folder, scope, base (branch), commit (commit).
+    this.source = p.scope ?? "uncommitted";
+    this.base = typeof p.base === "string" ? p.base : "";
+    this.commitRef = typeof p.commit === "string" ? p.commit : "";
+    this.commitOid = null;
     this.file = null;
     this.pendingFile = null;
     this.rowsSnapshot = null;
     this.rowsFingerprint = null;
     this.viewing = null;
     this.cache = new Map();
+    this.comparisons = new Map();
+    this.cachedComparison = false;
     this.reading = false;
     this.queued = null;
     this.watched = new Set();
@@ -152,7 +162,9 @@ export default class Codewalker extends View {
     this.handle = cx.focus_handle();
     this.client = new ReviewClient({ helper: p.helper ?? `${appHome()}/mods/Codewalker/backend.py` });
     this.rootInput = InputState.new({ placeholder: "Absolute path of a local Git checkout", value: this.folder });
-    this.baseInput = InputState.new({ placeholder: "Base ref, e.g. main" });
+    this.baseInput = InputState.new({ placeholder: "Base ref, e.g. main", value: this.base });
+    this.commitInput = InputState.new({ placeholder: "Commit SHA or ref, e.g. HEAD~1", value: this.commitRef || "HEAD" });
+    this.commitInput.on("change", (_event, cx) => cx.notify());
     this.composer = TextareaState.new({ placeholder: "Leave a comment", rows: 3 });
     this.composer.set_auto_grow(3, 7);
     this.composer.on("change", (_event, cx) => {
@@ -178,6 +190,7 @@ export default class Codewalker extends View {
     this.editor.on("submit", (event, cx) => { if (event.secondary && !event.shift) this.saveEdit(cx); });
     this.rootInput.on("submit", (_event, cx) => this.changeRoot(cx));
     this.baseInput.on("submit", (_event, cx) => this.applySource("branch", cx));
+    this.commitInput.on("submit", (_event, cx) => this.applySource("commit", cx));
     this.refresh(cx);
     // Folder watches drive refresh (see watch); this slow timer only covers missed events.
     cx.timer.every(15000, cx => { if (!this.reading) this.refresh(cx, true); });
@@ -219,7 +232,7 @@ export default class Codewalker extends View {
   }
 
   context() {
-    return { root: this.root ?? this.folder, on: this.on, source: this.source, baseRef: this.base || undefined, reviewId: this.reviewId, snapshotId: this.snapshotId, revision: this.revision };
+    return { root: this.root ?? this.folder, on: this.on, source: this.source, baseRef: this.base || undefined, commitRef: this.commitOid ?? this.commitRef, reviewId: this.reviewId, snapshotId: this.snapshotId, revision: this.revision };
   }
 
   refresh(cx, quiet = false) {
@@ -228,9 +241,9 @@ export default class Codewalker extends View {
 
   // One helper read returns the file list, discussions, drafts and one file's
   // hunks. At most one read runs; a newer request replaces the queued one.
-  read(cx, { path, quiet = true, retry = false } = {}) {
+  read(cx, { path, quiet = true, retry = false, resolveCommit = false } = {}) {
     if (!this.folder) return;
-    const want = { path: path === undefined ? this.pendingFile ?? this.file : path, quiet, retry };
+    const want = { path: path === undefined ? this.pendingFile ?? this.file : path, quiet, retry, resolveCommit };
     if (!quiet) { this.loading = true; this.error = null; }
     if (this.reading) {
       this.queued = { ...want, quiet: quiet && (this.queued?.quiet ?? true) };
@@ -238,14 +251,17 @@ export default class Codewalker extends View {
     }
     this.reading = true;
     const version = this.contextVersion, context = this.context();
+    if (resolveCommit && this.source === "commit") context.commitRef = this.commitRef;
     cx.spawn(async cx => {
       let next = null;
       try {
         const review = await this.client.review(context, want.path);
         if (version !== this.contextVersion) return;
         // A read that began before our own write must not roll discussions back. Retry once.
-        if (!this.apply(review, want, cx)) next = { path: want.path, quiet: true, retry: true };
-      } catch (error) { if (version === this.contextVersion) this.error = readableError(error); }
+        if (!this.apply(review, want, cx)) next = { ...want, quiet: true, retry: true };
+      } catch (error) {
+        if (version === this.contextVersion) this.error = `${this.cachedComparison ? "Showing the last loaded comparison. Refresh before making changes. " : ""}${readableError(error)}`;
+      }
       finally {
         if (version === this.contextVersion) {
           this.reading = false;
@@ -264,12 +280,18 @@ export default class Codewalker extends View {
     const same = review.reviewId === this.reviewId;
     if (same && !want.retry && Number.isInteger(this.revision) && review.revision < this.revision) return false;
     if (!same || review.snapshotId !== this.snapshotId) this.cache.clear();
+    this.comparisons.delete(this.source);
+    this.cachedComparison = false;
     this.root = review.root;
     this.reviewId = review.reviewId;
     this.snapshotId = review.snapshotId;
     this.revision = review.revision;
     this.branch = review.branch;
     this.resolvedBase = review.baseOid;
+    if (this.source === "commit") {
+      this.commitOid = review.commitOid;
+      this.commitParents = review.parentCount;
+    }
     if (this.source === "branch") this.base = review.baseRef ?? this.base;
     if (this.source === "branch" && !this.baseInput.value()) this.baseInput.set_value(this.base);
     this.files = review.files;
@@ -365,7 +387,7 @@ export default class Codewalker extends View {
   // while a file read is pending. No optimistic mark: a failed save stays unseen.
   setViewed(viewed, cx) {
     const file = this.files.find(file => file.path === this.file);
-    if (!file || !this.rowsFingerprint || file.diffFingerprint !== this.rowsFingerprint
+    if (this.cachedComparison || !file || !this.rowsFingerprint || file.diffFingerprint !== this.rowsFingerprint
         || this.pendingFile || this.viewing || this.saving || this.leaving || this.postAttempt) return;
     const context = this.context(), version = this.contextVersion;
     const attempt = { path: file.path, fingerprint: this.rowsFingerprint, viewed };
@@ -397,7 +419,7 @@ export default class Codewalker extends View {
 
   viewedBox(file) {
     const t = theme(), checked = file.viewed === true;
-    const enabled = Boolean(this.rowsFingerprint) && file.diffFingerprint === this.rowsFingerprint
+    const enabled = !this.cachedComparison && Boolean(this.rowsFingerprint) && file.diffFingerprint === this.rowsFingerprint
       && !this.pendingFile && !this.viewing && !this.saving && !this.leaving && !this.postAttempt;
     const hint = !file.diffFingerprint ? "This change has no reliable content fingerprint"
       : "Mark this version of the file as viewed; new changes clear the mark";
@@ -451,20 +473,58 @@ export default class Codewalker extends View {
     });
   }
 
-  applySource(source, cx) {
-    const base = this.baseInput.value().trim();
-    if (source === "branch" && !base) { this.error = "Enter a local base ref before opening a branch comparison."; cx.notify(); return; }
-    if (source === this.source && (source !== "branch" || this.base === base)) return;
-    this.withSavedDraft(cx, cx => {
-      this.source = source;
-      this.base = base;
-      this.resetContext();
-      this.refresh(cx);
+  comparisonKey() {
+    return JSON.stringify([this.folder, this.on, this.source, this.source === "branch" ? this.base : this.source === "commit" ? this.commitRef : null]);
+  }
+
+  rememberComparison() {
+    if (!this.reviewId || !this.snapshotId || this.cachedComparison) return;
+    this.comparisons.set(this.source, {
+      key: this.comparisonKey(),
+      state: Object.fromEntries(COMPARISON_FIELDS.map(field => [field, this[field]])),
+      cache: new Map(this.cache), expanded: new Set(this.expanded),
     });
   }
 
-  resetContext() {
+  restoreComparison() {
+    const saved = this.comparisons.get(this.source);
+    if (!saved || saved.key !== this.comparisonKey()) return false;
+    Object.assign(this, saved.state);
+    this.cache = new Map(saved.cache);
+    this.expanded = new Set(saved.expanded);
+    this.cachedComparison = true;
+    return true;
+  }
+
+  applySource(source, cx, { resolveCommit = true } = {}) {
+    if (this.saving || this.leaving || this.sending || this.viewing || this.editing?.saving) return;
+    const base = this.baseInput.value().trim(), commit = this.commitInput.value().trim();
+    if (source === "commit" && !commit) { this.error = "Enter a commit SHA or ref."; cx.notify(); return; }
+    if (source === "branch" && !base) { this.error = "Enter a local base ref before opening a branch comparison."; cx.notify(); return; }
+    if (source === this.source && (source === "commit" ? !resolveCommit && this.commitRef === commit : source !== "branch" || this.base === base)) {
+      this.pickBase = false;
+      cx.notify();
+      return;
+    }
+    this.withSavedDraft(cx, cx => {
+      this.rememberComparison();
+      this.source = source;
+      this.pickBase = false;
+      this.base = base;
+      this.commitRef = commit;
+      this.resetContext({ keepComparisons: true });
+      const restored = this.restoreComparison();
+      this.read(cx, { quiet: restored, resolveCommit });
+      cx.notify();
+    });
+  }
+
+  resetContext({ keepComparisons = false } = {}) {
     this.contextVersion++;
+    if (!keepComparisons) this.comparisons.clear();
+    this.cachedComparison = false;
+    this.commitOid = null;
+    this.commitParents = null;
     this.loading = false;
     this.reading = false;
     this.queued = null;
@@ -484,6 +544,7 @@ export default class Codewalker extends View {
     this.files = [];
     this.rows = [];
     this.threads = [];
+    this.note = this.fileNote = this.branch = this.resolvedBase = null;
     this.page = 0;
     this.from = null;
     this.jumpTo = null;
@@ -541,6 +602,7 @@ export default class Codewalker extends View {
   }
 
   begin(anchor, cx, thread = null) {
+    if (this.cachedComparison) return;
     this.withSavedDraft(cx, cx => {
       this.intent = { id: newId(), path: thread?.path ?? this.file, anchor, threadId: thread?.id ?? null, snapshotId: this.rowsSnapshot ?? this.snapshotId, context: this.context(), replyRequested: this.askReply };
       this.composer.set_value("");
@@ -583,7 +645,7 @@ export default class Codewalker extends View {
   }
 
   canAnchor() {
-    return !(this.saving || this.leaving || this.postAttempt || this.pendingFile);
+    return !(this.cachedComparison || this.saving || this.leaving || this.postAttempt || this.pendingFile);
   }
 
   selectAnchor(anchor, extend, cx) {
@@ -696,6 +758,7 @@ export default class Codewalker extends View {
   }
 
   restoreDraft(draft, cx) {
+    if (this.cachedComparison) return;
     this.withSavedDraft(cx, cx => {
       this.intent = draft.intent ?? { id: draft.id, path: draft.path, anchor: draft.anchor, threadId: draft.threadId };
       const receipt = this.intent.pendingPost;
@@ -752,7 +815,7 @@ export default class Codewalker extends View {
   }
 
   startEdit(message, cx) {
-    if (!this.mine(message) || this.editing?.id === message.id) return;
+    if (this.cachedComparison || !this.mine(message) || this.editing?.id === message.id) return;
     if (this.editing && this.editor.value() !== this.editing.body) { this.error = "Save or cancel the open edit first."; cx.notify(); return; }
     this.editing = { id: message.id, body: message.body, commandId: newId() };
     this.editor.set_value(message.body);
@@ -791,7 +854,7 @@ export default class Codewalker extends View {
   // Two steps: Delete asks, the red Delete removes. The first comment takes
   // its thread (and every reply) with it.
   deleteMessage(message, cx) {
-    if (!this.mine(message) || this.saving) return;
+    if (this.cachedComparison || !this.mine(message) || this.saving) return;
     if (this.confirmDelete !== message.id) { this.confirmDelete = message.id; cx.notify(); return; }
     this.saving = true;
     this.error = null;
@@ -846,7 +909,7 @@ export default class Codewalker extends View {
   // A lost answer stays uncertain until the person checks the agent's chat.
   send(cx) {
     const target = this.target(), items = sendable(this.threads, { again: this.sendAgain });
-    if (!target || !READY.has(target.status) || !items.length || this.sending || !this.reviewId) return;
+    if (this.cachedComparison || !target || !READY.has(target.status) || !items.length || this.sending || !this.reviewId) return;
     const ids = items.flatMap(item => item.messageIds), context = this.context();
     const text = sendText({ items, root: this.root, branch: this.branch, helper: this.client.helper, note: this.sendNote.value() });
     const name = target.program?.name ?? target.title ?? target.address;
@@ -881,7 +944,7 @@ export default class Codewalker extends View {
   // After checking the agent's chat: the unclear send did arrive.
   markArrived(cx) {
     const ids = this.threads.flatMap(thread => thread.messages.filter(message => this.mine(message) && message.delivery?.state === "uncertain").map(message => message.id));
-    if (!ids.length || this.sending) return;
+    if (this.cachedComparison || !ids.length || this.sending) return;
     this.sending = true;
     cx.spawn(async cx => {
       try { this.wrote(await this.client.deliver(this.context(), ids, "sent", this.threads.flatMap(t => t.messages).find(m => ids.includes(m.id))?.delivery?.target ?? "", newId())); this.sendNotice = null; }
@@ -892,7 +955,7 @@ export default class Codewalker extends View {
   }
 
   setStatus(thread, cx) {
-    if (this.saving) return;
+    if (this.cachedComparison || this.saving) return;
     this.saving = true;
     cx.spawn(async cx => {
       try { this.wrote(await this.client.setStatus(this.context(), thread.id, thread.status === "resolved" ? "open" : "resolved", newId())); this.refresh(cx, true); }
@@ -920,13 +983,13 @@ export default class Codewalker extends View {
         ...(outdated ? [this.pill("Code changed since", t.ansi1)] : orphan ? [div().flex_none().text_size(11).text_color(t.blocked).child("Outside this page")] : []),
         div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(open ? "" : `${count} ${count === 1 ? "message" : "messages"}`),
         ...(resolved ? [this.button(`toggle-${thread.id}`, open ? "Hide" : "Show", toggle, { small: true, ghost: true })] : []),
-        this.button(`status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.saving }),
+        this.button(`status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.cachedComparison && !this.saving }),
       ]))
       .when(open && outdated && Boolean(thread.anchor?.snippet), el => el.child(div().px(12).py(8).border_b(1).border_color(t.border).bg(t.background).font_family(settings().font_family).text_size(11).text_color(t.muted)
         .child(Array.isArray(thread.anchor.snippet) ? thread.anchor.snippet.join("\n") : thread.anchor.snippet)))
       .when(open, el => el.child(v_flex().px(12).py(10).gap(12).children(thread.messages.map((message, index) => this.messageView(message, "message", index === 0))))
         .when(!resolved || this.commentActions(thread, "message").length > 0, el => el.child(h_flex().px(12).pb(10).gap(6).items_center()
-          .when(!resolved, el => el.child(this.button(`reply-${thread.id}`, "Reply", cx => this.begin(thread.anchor, cx, thread), { small: true, ghost: true, icon: ICON.reply, enabled: !this.saving })))
+          .when(!resolved, el => el.child(this.button(`reply-${thread.id}`, "Reply", cx => this.begin(thread.anchor, cx, thread), { small: true, ghost: true, icon: ICON.reply, enabled: !this.cachedComparison && !this.saving })))
           .children(this.commentActions(thread, "message")))));
   }
 
@@ -934,7 +997,7 @@ export default class Codewalker extends View {
   // replies carry their own.
   commentActions(thread, prefix) {
     const first = thread.messages[0];
-    if (!first || !this.mine(first) || this.editing?.id === first.id || this.confirmDelete === first.id || this.saving || this.postAttempt) return [];
+    if (this.cachedComparison || !first || !this.mine(first) || this.editing?.id === first.id || this.confirmDelete === first.id || this.saving || this.postAttempt) return [];
     return [
       this.button(`${prefix}-edit-${first.id}`, "Edit", cx => this.startEdit(first, cx), { small: true, ghost: true, icon: ICON.pencil, label: "Edit your comment" }),
       this.button(`${prefix}-delete-${first.id}`, "Delete", cx => this.deleteMessage(first, cx), { small: true, ghost: true, icon: ICON.trash, label: "Delete this comment and its thread" }),
@@ -943,7 +1006,7 @@ export default class Codewalker extends View {
 
   messageView(message, prefix = "message", first = false) {
     const t = theme(), actor = actorLabel(message), edit = this.editing?.id === message.id ? this.editing : null;
-    const canEdit = this.mine(message) && !edit && !this.saving && !this.postAttempt, confirming = this.confirmDelete === message.id;
+    const canEdit = !this.cachedComparison && this.mine(message) && !edit && !this.saving && !this.postAttempt, confirming = this.confirmDelete === message.id;
     return v_flex().id(`${prefix}-${message.id}`).gap(3).text_size(12)
       .child(h_flex().gap(6).items_center()
         .child(div().font_semibold().text_color(t.foreground).child(actor.name))
@@ -1031,7 +1094,7 @@ export default class Codewalker extends View {
         .when(unclear > 0, el => el.child(v_flex().mx(14).mt(12).p(10).gap(8).rounded(8).border_1().border_color(tint(t.blocked, 0x66)).bg(tint(t.blocked, 0x14))
           .child(div().text_size(12).text_color(t.blocked).child(`${unclear} ${unclear === 1 ? "discussion was" : "discussions were"} sent, but delivery is unclear. Check the agent's chat first.`))
           .child(h_flex().gap(6)
-            .child(this.button("mark-arrived", "It arrived", cx => this.markArrived(cx), { small: true, icon: ICON.check, enabled: !this.sending }))
+            .child(this.button("mark-arrived", "It arrived", cx => this.markArrived(cx), { small: true, icon: ICON.check, enabled: !this.cachedComparison && !this.sending }))
             .child(this.button("send-again", this.sendAgain ? "Included below" : "I checked · Send again", cx => { this.sendAgain = !this.sendAgain; cx.notify(); }, { small: true, selected: this.sendAgain, enabled: !this.sending })))))
         .child(section("Agent"))
         .child(v_flex().px(8).gap(1)
@@ -1058,7 +1121,7 @@ export default class Codewalker extends View {
       .child(h_flex().flex_none().px(14).py(10).gap(8).items_center().border_t(1).border_color(t.border)
         .child(div().flex_1().min_w(0).text_size(11).text_color(this.sendNotice?.error ? t.blocked : t.dim)
           .child(this.sendNotice?.error ?? (why || "Pastes into the agent only when it is idle.")))
-        .child(this.button("send-to-agent", this.sending ? "Sending…" : "Send", cx => this.send(cx), { small: true, primary: true, icon: ICON.send, enabled: !this.sending && ready && items.length > 0 })));
+        .child(this.button("send-to-agent", this.sending ? "Sending…" : "Send", cx => this.send(cx), { small: true, primary: true, icon: ICON.send, enabled: !this.cachedComparison && !this.sending && ready && items.length > 0 })));
   }
 
   // Toolbar Send: shown while there is something new (or unclear) to send, and in the Send view.
@@ -1080,7 +1143,7 @@ export default class Codewalker extends View {
         .when(thread.awaitingReply === true, el => el.child(this.pill("Awaiting reply", t.working)))
         .when(outdated, el => el.child(this.pill("Code changed since", t.ansi1)))
         .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(t.dim).child(open ? (last ? timestamp(last.createdAt) : "") : `${thread.messages.length} ${thread.messages.length === 1 ? "message" : "messages"}`))
-        .child(this.button(`list-status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.saving })))
+        .child(this.button(`list-status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.cachedComparison && !this.saving })))
       .when(open && Boolean(lines[0]), el => el.child(v_flex().px(8).py(6).rounded(6).bg(t.surface).border_1().border_color(t.border)
         .font_family(settings().font_family).text_size(11).text_color(t.muted)
         .children(lines.slice(0, 3).map(line => div().truncate().child(line || " ")))
@@ -1090,7 +1153,7 @@ export default class Codewalker extends View {
         .children(replies.map(message => this.messageView(message, "list")))))
       .child(h_flex().gap(6).items_center()
         .child(this.button(`show-${thread.id}`, "Show in diff", cx => this.showThread(thread, cx), { small: true, ghost: true }))
-        .when(!resolved, el => el.child(this.button(`list-reply-${thread.id}`, "Reply", cx => this.showThread(thread, cx, true), { small: true, ghost: true, icon: ICON.reply, enabled: !this.saving })))
+        .when(!resolved, el => el.child(this.button(`list-reply-${thread.id}`, "Reply", cx => this.showThread(thread, cx, true), { small: true, ghost: true, icon: ICON.reply, enabled: !this.cachedComparison && !this.saving })))
         .when(open, el => el.children(this.commentActions(thread, "list")))
         .when(resolved, el => el.child(this.button(`list-toggle-${thread.id}`, open ? "Hide" : "Show", toggle, { small: true, ghost: true }))));
   }
@@ -1256,7 +1319,7 @@ export default class Codewalker extends View {
     const root = this.root ?? this.folder;
     const { name: fileName, dir: fileDir } = splitPath(selected ?? "");
     const pickingBase = this.source === "branch" || this.pickBase;
-    const baseText = this.baseInput.value().trim();
+    const baseText = this.baseInput.value().trim(), commitText = this.commitInput.value().trim();
     // Stacked: the file list takes what its rows need, at most about a third of the height.
     const listRows = Math.max(1, shownFiles.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0);
     const listH = Math.round(Math.min(78 + listRows * 29, Math.max(120, this.height * 0.34)));
@@ -1301,7 +1364,7 @@ export default class Codewalker extends View {
           this.pendingFile ? this.emptyState("Loading diff…", "", true)
           : this.reading && !this.root ? this.emptyState("Reading changes…", "", true)
           : this.file ? this.emptyState("No line changes to show", this.fileNote ? "" : "Binary, mode-only and unchanged files have no lines to comment on.")
-          : this.root && !this.files.length ? this.emptyState("Nothing to review", this.source === "branch" ? `The working tree matches ${this.base}.` : "The working tree matches HEAD.")
+          : this.root && !this.files.length ? this.emptyState("Nothing to review", this.source === "commit" ? "This commit has no changes against its first parent." : this.source === "branch" ? `The working tree matches ${this.base}.` : "The working tree matches HEAD.")
           : this.root ? this.emptyState("Select a file", wide ? "Choose a changed file on the left." : "Choose a changed file above.")
           : this.emptyState("Open a checkout", "Enter the absolute path of a local Git checkout above."))))
       .when(visible.pages > 1 || visible.start > 0, el => el.child(h_flex().h(36).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border)
@@ -1328,14 +1391,16 @@ export default class Codewalker extends View {
         else if (this.mode === "discussions") { this.mode = "files"; cx.notify(); cx.stop_propagation(); }
       })
       // One compact toolbar; comparison details live in tooltips, not a title row.
-      .child(h_flex().id("review-controls").min_h(40).flex_none().px(14).py(7).gap(6).flex_wrap().items_center().border_b(1).border_color(t.border)
+      .child(h_flex().id("review-controls").min_h(40).flex_none().px(compact ? 10 : 14).py(7).gap(compact ? 4 : 6).flex_wrap().items_center().border_b(1).border_color(t.border)
         .child(h_flex().flex_none().h(26).p(2).gap(2).items_center().rounded(7).bg(t.background).border_1().border_color(t.border)
-          .children([["uncommitted", "Uncommitted"], ["branch", "Branch"]].map(([source, label]) => {
-            const on = source === "branch" ? pickingBase : !pickingBase;
-            return Button.new(`scope-${source}`).h(20).px(10).rounded(5).text_size(12).bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
+          .children([["uncommitted", "Uncommitted"], ["branch", "Branch"], ["commit", "Commit"]].map(([source, label]) => {
+            const on = source === (pickingBase ? "branch" : this.source);
+            return Button.new(`scope-${source}`).h(20).px(compact ? 7 : 10).rounded(5).text_size(12).bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
               .cursor_pointer().hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground)).disabled(this.saving).accessibility_label(`Compare ${label.toLowerCase()} changes`)
-              .tooltip(source === "uncommitted" ? "HEAD → working tree · staged, unstaged and untracked files" : `${this.base || "Choose a base ref"} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}`)
+              .tooltip(source === "commit" ? "First parent → selected commit · no working-tree changes"
+                : source === "uncommitted" ? "HEAD → working tree · staged, unstaged and untracked files" : `${this.base || "Choose a base ref"} → working tree · merge base ${this.resolvedBase?.slice(0, 8) ?? "…"}`)
               .on_mouse_down("left", stop).on_click((_event, cx) => {
+                if (source === "commit") { this.applySource("commit", cx, { resolveCommit: false }); return; }
                 if (source === "uncommitted") { this.pickBase = false; this.applySource("uncommitted", cx); cx.notify(); return; }
                 if (baseText) this.applySource("branch", cx);
                 else { this.pickBase = true; this.baseInput.focus(); cx.notify(); }
@@ -1353,6 +1418,13 @@ export default class Codewalker extends View {
             .flex_1().min_w(0)
             .child(Input.new(this.baseInput).h_full().text_size(12).text_color(t.foreground)))
           .child(this.button("apply-base", "Compare", cx => this.applySource("branch", cx), { enabled: !this.saving && Boolean(baseText) && (this.source !== "branch" || baseText !== this.base) }))))
+      .when(this.source === "commit" && !pickingBase, el => el.child(h_flex().min_h(40).flex_none().px(14).py(7).gap(8).items_center().border_b(1).border_color(t.border)
+        .child(div().h(26).flex_1().min_w(0).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
+          .child(Input.new(this.commitInput).h_full().text_size(12).text_color(t.foreground).accessibility_label("Commit SHA or ref")))
+        .when(Boolean(this.commitOid), el => el.child(div().flex_none().text_size(11).text_color(t.muted)
+          .tooltip(`${this.commitOid} · ${this.commitParents === 0 ? "empty tree" : "first parent"} → commit`)
+          .child(this.commitOid.slice(0, 8))))
+        .child(this.button("apply-commit", "Show", cx => this.applySource("commit", cx), { enabled: !this.saving && !this.leaving && Boolean(commitText), tooltip: "Resolve this SHA or ref and show its commit diff" }))))
       // Folder entry: on request, or until a checkout loads.
       .when(this.editRoot || (!this.root && !this.reading), el => el.child(h_flex().flex_none().px(14).py(8).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().flex_1().min_w(0).h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
