@@ -4,6 +4,8 @@ Native code review for Herdr: uncommitted, branch and single-commit diffs, old/n
 
 ![Codewalker: native diff review with an inline human–agent discussion](preview.png)
 
+> **No layout included.** This package provides the mod only. Configure your own Herdr layout to choose where it appears and how it opens ([example](#review-in-the-side-panel-your-own-layout)). The preview shows the mod, not a bundled layout.
+
 ## Requirements and boundaries
 
 - Installed Herdr desktop with the native mod APIs; verified against `herdr-app 0.1.12` on macOS.
@@ -93,9 +95,17 @@ python3 ~/.config/herdr-app/mods/Codewalker/backend.py open \
 
 ### Review in the side panel (your own layout)
 
-Codewalker ships no layout. In a layout you own (a copy of `main`), it can also sit in the side panel, opened by a **Review** button beside the tab bar, like Files and Changes:
+This example puts a **Review** button beside the tab bar and opens Codewalker in the right-hand panel. It uses the same toolbar-and-panel wiring as our own setup, but does not include a full layout.
 
-1. Replace the `tabs` block with a row that holds it and the button:
+Edit only a layout you own, under `${HERDR_APP_HOME:-$HOME/.config/herdr-app}/layouts/`. Never edit Herdr's shipped `main.json`. If you need a personal copy, the following command creates **and switches to** `my-layout`; choose an unused name:
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"my-layout"}'
+```
+
+The snippets below are fragments to merge into that copy, not replacement layout files.
+
+1. In `work.children`, replace the standalone `tabs` block with this `tab-bar` row. If you already have a tab-bar row, append only the `review-button` block to its `children`; keep your existing tabs and other buttons:
 
    ```json
    { "id": "tab-bar", "type": "row", "size": { "px": 42 }, "resizable": false, "children": [
@@ -104,13 +114,15 @@ Codewalker ships no layout. In a layout you own (a copy of `main`), it can also 
    ] }
    ```
 
-2. Add Review to the `panel-body` stack, after `changes`:
+2. In the existing `panel` column, append this child to the `panel-body` stack's `children`. Keep Files, Changes, Git, or any other existing children:
 
    ```json
    { "id": "review", "type": "block", "content": { "mod": "Codewalker" } }
    ```
 
-The button adds `"review"` to the shared `workspace.panels` list, so the tab bar remembers Review per space like the other panels. In such a layout the key toggles the side panel instead of a pane. In the side panel Review shows the focused terminal's checkout and follows focus.
+Keep the IDs **`panel`**, **`panel-body`**, and **`review`** exactly as shown: Codewalker uses them to find, select, and show the panel. Each ID must occur only once. The `panel` column and `panel-body` stack already exist in a copy of `main`; these fragments alone do not create them in an unrelated layout.
+
+Save your personal layout, then click **Review** to show or hide the panel. The button adds `"review"` to the shared `workspace.panels` list, so the shipped tabs mod remembers it per space. The `mod.open:Codewalker` key now toggles this panel instead of a pane. Review follows the focused terminal's local checkout. No pinned folder or personal path is needed.
 
 ## Review flow
 
