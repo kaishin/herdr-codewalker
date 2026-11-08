@@ -18,6 +18,7 @@ OUT = PROJECT / "mods/Codewalker/icons"
 ICONS = {
     "check": "check", "folder": "folder", "git-branch": "git-branch", "message": "message-square",
     "pencil": "pencil", "plus": "plus", "refresh": "refresh-cw", "reply": "reply", "send": "send", "trash": "trash-2", "x": "x",
+    "maximize-2": "maximize-2", "minimize-2": "minimize-2",
 }
 SHAPES = {"path", "circle", "rect", "line", "polyline", "polygon", "ellipse"}
 GEOMETRY = {"d", "cx", "cy", "r", "rx", "ry", "x", "y", "width", "height", "x1", "y1", "x2", "y2", "points"}

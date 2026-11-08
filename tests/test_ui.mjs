@@ -994,3 +994,75 @@ test("returning to an empty comparison keeps the loaded empty state during refre
   gate.resolve(review());
   await drain();
 });
+
+function dockHost({ max } = {}) {
+  const body = { id: "panel-body", type: "stack", active: "review", children: [{ id: "review", type: "block", content: { mod: "Codewalker" } }] };
+  const panel = { id: "panel", type: "column", size: { px: 368 }, ...(max ? { max } : {}), children: [body] };
+  const main = { id: "main", type: "block", content: { tab: "active" } };
+  const root = { id: "work-body", type: "row", children: [main, panel] };
+  const state = new Map([["layout", "personal"]]), commands = [];
+  return { root, panel, main, state, commands, overrides: {
+    layout: () => root, shared: key => state.get(key), setShared: (key, value) => state.set(key, value),
+    run: (name, args) => {
+      commands.push([name, args]);
+      const node = args.id === "main" ? main : panel;
+      if (name === "layout.hide") node.hidden = true;
+      else if (name === "layout.show") node.hidden = false;
+      else if (name === "layout.resize") node.size = args.px !== undefined ? { px: args.px } : { weight: args.weight };
+      else assert.fail(`Unexpected command: ${name}`);
+    },
+  } };
+}
+
+test("docked expand and restore leave the current diff, cache, and unsaved draft intact", async () => {
+  const host = dockHost();
+  let writes = 0, commandRead = false;
+  const command = deferred();
+  const { view, cx, drain } = await modules({ ...host.overrides,
+    nextCommand: () => { if (commandRead) return new Promise(() => {}); commandRead = true; return command.promise; },
+    client: { saveDraft: async () => { writes++; } },
+  });
+  view.rows = [{ kind: "+", newLine: 1, text: "kept diff" }];
+  view.page = 2;
+  view.rememberComparison();
+  const intent = view.intent, composer = view.composer, rows = view.rows, comparisons = view.comparisons;
+  command.resolve("expand"); await settle();
+  assert.equal(host.main.hidden, true);
+  assert.equal(host.panel.size.weight, 1);
+  assert.equal(view.expansionState().expanded, true);
+  view.toggleExpansion(cx);
+  view.reconcileExpansion(cx); await drain();
+  assert.equal(host.main.hidden, false);
+  assert.equal(host.panel.size.px, 368);
+  assert.equal(view.expansionState().expanded, false);
+  assert.equal(view.intent, intent);
+  assert.equal(view.composer, composer);
+  assert.equal(view.composer.value(), "Human question");
+  assert.equal(view.rows, rows);
+  assert.equal(view.page, 2);
+  assert.equal(view.comparisons, comparisons);
+  assert.equal(writes, 0, "resizing must not submit, save, or navigate a review");
+});
+
+test("pane and overlay reviews never operate on the layout's dock", async () => {
+  for (const properties of [{ framed: true }, { overlay: "review-window" }]) {
+    const host = dockHost();
+    const { view, cx } = await modules({ ...host.overrides, props: () => properties });
+    assert.equal(view.expansionState(), null);
+    view.toggleExpansion(cx);
+    assert.equal(host.commands.length, 0);
+  }
+});
+
+test("closing an expanded dock restores the workspace through the view lifecycle", async () => {
+  const host = dockHost();
+  const { view, cx, drain } = await modules(host.overrides);
+  view.toggleExpansion(cx);
+  host.panel.hidden = true; // A key or the layout's toolbar closed the panel.
+  view.reconcileExpansion(cx); await drain();
+  view.reconcileExpansion(cx); await drain();
+  assert.equal(host.main.hidden, false);
+  assert.equal(host.panel.hidden, true, "restoring width must not reopen a closed panel");
+  assert.equal(host.panel.size.px, 368);
+  assert.equal(Object.keys(host.state.get("workspace.expanded.v1")).length, 0);
+});

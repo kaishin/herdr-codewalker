@@ -47,6 +47,12 @@ Run `python3 scripts/check-ui.py` after UI changes. It checks the native populat
 
 Post-fix live evidence: a screenshot was captured and inspected at 3840×2098 physical pixels. The supported `mod.open Codewalker` dialog showed a checkout's 55 changed paths, selected `AGENTS.md`, and its two real red/green hunks with old/new gutters. A matching pre-fix capture showed the blank body. The toolbar's nonmodal-window activation, resizing, scrolling and discussion interactions were not exercised by that command-path capture.
 
+## Panel expansion
+
+A 26px Expand/Restore icon is the trailing-most action in the existing top toolbar of a supported docked Review. It is absent from pane and overlay copies. It changes only Herdr layout clicks; the review instance, selected diff, caches, and drafts stay intact. A finite panel `max` is respected and named in the tooltip. Without a cap, expansion hides only visible siblings in the same row; the app sidebar and tab bar stay available. Git and Codewalker share the restore receipt per layout. Closing the panel or selecting Files restores the workspace. Failed restoration retains a retry and does not poll or spin redraws.
+
+Command-path verification: installed Codewalker widened a capped panel from 537px to 900px and restored 537px. Git restored an expansion started by Codewalker, and Codewalker restored one started by Git. Closing Review through `mod.open` restored the width before hiding it. Layout file and click-state bytes matched their pre-test values afterwards; shared receipts were cleared and app status had no errors or overlays. Native screenshots showed both icons and the responsive wide diff. After the user approved removing the personal panel cap, uncapped fill was also verified through the command path and a native screenshot: the review filled the workspace, then Restore returned the panel to its prior 525px width and showed the terminal again. Pointer activation and live draft typing remain manual checks.
+
 ## Manual verification after authorized installation
 
 Initial/eager native checks and synthetic populated-state checks are automated; these checks do **not** verify paint or interaction. The following remains human-driven:
@@ -56,4 +62,5 @@ Initial/eager native checks and synthetic populated-state checks are automated; 
 3. Click new/old/deleted-side lines, Shift-click a range, type multiline text, navigate/refresh while typing, close/reopen and restore a draft. Verify native keyboard focus and submit shortcut on the installed OS; test code/text selection separately from line-gutter activation.
 4. Post as human, reply through the documented agent CLI, refresh, resolve/reopen. Confirm authors, bodies, original location and history survive a changed file leaving the diff.
 5. Exercise missing base, nonrepository, helper failure, binary/oversized/unsupported files, external revision conflict and saved uncertain-post recovery. No error may erase an unsaved editor buffer or silently post a new duplicate command.
-6. Close the Review pane (the same key). Layout, settings/keys symlinks and durable review data must remain intact.
+6. Expand/restore the dock with a draft open. Verify the selected diff and text remain, both icons work with pointer/keyboard focus, and closing the panel while expanded restores the main workspace. Switch between Git and Review, and check that either can restore the shared panel.
+7. Close the Review pane (the same key). Layout, settings/keys symlinks and durable review data must remain intact.

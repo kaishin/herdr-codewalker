@@ -81,7 +81,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="codewalker-native-fixture-") as temp:
         destination = Path(temp).resolve() / "mod"
         destination.mkdir()
-        for name in ("main.js", "client.js", "model.js", "mod.json", "review.svg"):
+        for name in ("main.js", "client.js", "model.js", "dock-expand.js", "mod.json", "review.svg"):
             shutil.copy2(ROOT / "mods/Codewalker" / name, destination / ("view.js" if name == "main.js" else name))
         shutil.copytree(ROOT / "mods/Codewalker/icons", destination / "icons")
         # Settled; a file switch in progress (the shown diff stays, dimmed); a
@@ -98,16 +98,23 @@ def main():
         branch = 'this.width = 368; this.height = 900; this.source = "branch"; this.base = "main"; this.baseInput.set_value("main");'
         commit = 'this.width = 368; this.height = 900; this.source = "commit"; this.commitOid = "0123456789abcdef"; this.commitParents = 2; this.commitInput.set_value("HEAD~1");'
         cached = 'this.width = 368; this.height = 900; this.rememberComparison(); this.resetContext({keepComparisons:true}); this.restoreComparison(); this.reading = true;'
-        for pending, extra in (("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit)):
+        expandable = 'this.width = 368; this.expansionState = () => ({supported:true, expanded:false, mode:"fill"});'
+        expanded = 'this.width = 1100; this.expansionState = () => ({supported:true, expanded:true, mode:"fill"});'
+        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
-            narrow = extra in (docked, viewed, hidden, branch, commit, cached)
+            narrow = extra in (expandable, docked, viewed, hidden, branch, commit, cached)
             lines = spec.splitlines()
             root = next(i for i, line in enumerate(lines) if ':id[Str("codewalker")]' in line)
             assert ':id[Str("review-controls")]' in lines[root + 1], "Scope and actions are the first row; no title row above them"
             check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"')
+            assert ('Button "expand-review"' in spec) == (extra in (expandable, expanded)), "Expand is offered only for supported docked views"
+            if extra in (expandable, expanded):
+                check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"', 'Button "open-send"', 'Button "expand-review"')
+                assert f"icons/{'minimize-2' if extra == expanded else 'maximize-2'}.svg" in spec
+                assert ("Restore panel width" if extra == expanded else "Expand to fill the workspace") in spec
             assert 'text "HEAD → working tree' not in spec, "Comparison explanation belongs in a tooltip, not a text row"
             assert ('Button "apply-base"' in spec) == (extra == branch), "Branch comparison keeps an explicit base editor"
             assert 'Button "scope-commit"' in spec, "Commit is the third scope"

@@ -8,7 +8,7 @@ Review a local checkout without leaving Herdr. Read uncommitted, branch, or sing
 
 The mod uses Herdr's theme and installed UI/code fonts. It is a full-height native view, not a webview or terminal application.
 
-- **Toolbar:** Uncommitted, Branch, and Commit segments, then Refresh, Discussions, and Change folder icons. Send appears when there are unsent or uncertain comments. An overlay also offers Close. There is no separate title row. Standard controls are 26px high, small ones 22px; text is mostly 12–13px, with 11px metadata.
+- **Toolbar:** Uncommitted, Branch, and Commit segments, then Refresh, Discussions, and Change folder icons. Send appears when there are unsent or uncertain comments. An overlay also offers Close. In a supported docked panel, Expand/Restore is the trailing-most action. There is no separate title row. Standard controls are 26px high, small ones 22px; text is mostly 12–13px, with 11px metadata.
 - **Comparison input:** Branch adds a local base-ref field and Compare. Commit adds a SHA/ref field, Show, and the resolved short SHA. Comparison details are in tooltips. Folder entry appears on request or when no checkout is connected.
 - **Changed files:** paths, change status, optional line counts, discussion count, viewed checkmarks, and an explicit **n of m viewed** row with Hide viewed / Show all. Retained discussions and saved drafts remain accessible below changed files.
 - **Diff:** file header with Viewed, Git old/new line numbers, added/deleted line backgrounds, and inline discussion cards. Hover reveals a comment button. Binary, oversized, and special-file changes have an explanation rather than fake lines. Empty-state padding is 14px horizontally and 12px vertically.
@@ -23,6 +23,7 @@ The gallery preview uses a real native render with documented synthetic data. It
 
 ## How it behaves
 
+- The top Expand/Restore icon changes only layout clicks, not the layout file or the review instance. With no panel `max`, it hides visible siblings in the panel's row and fills it; with a finite cap, it widens to that cap without hiding siblings. Restore returns the prior width and siblings. Closing the panel or selecting a non-participating mod restores automatically. Git and Codewalker share a durable per-layout receipt in `workspace.expanded.v1`; a failed restore keeps a retry instead of looping. `Codewalker.expand` invokes the same action for a visible docked copy.
 - **Uncommitted:** HEAD → working tree, including staged, unstaged, and nonignored untracked changes. **Branch:** merge-base(selected base, HEAD) → working tree. **Commit:** first parent → selected commit, or empty tree → root commit. A merge uses its first parent. Commit mode never reads working-tree content for the diff and never checks out the commit.
 - A commit ref resolves to a full SHA and stays pinned through refresh and mode navigation. Show resolves the input again. Invalid refs or unavailable shallow parents report errors; they do not fall back to a worktree review or fetch history.
 - Each mode keeps its last comparison for the current checkout. Returning to the same base/ref restores its selected diff and page immediately, then refreshes in the background. Cached discussions and viewed state are read-only until revalidated. Failed refreshes retain the old diff with an explanation. Another checkout clears these caches.
@@ -41,10 +42,11 @@ The gallery preview uses a real native render with documented synthetic data. It
 - `main.js`: GPUI `View`, native gpui-base layout, buttons, checkboxes, inputs, text areas, and Markdown text; navigation, draft lifecycle, file watches, bounded caches, and agent delivery.
 - `client.js`: argv-only `exec("python3", ...)` calls to the adjacent `backend.py`, read normalization, serialized mutations, revision tracking, and persisted post receipts.
 - `model.js`: diff/anchor, discussion, formatting, and delivery-text helpers.
+- `dock-expand.js`: shared expansion/restore controller, bundled identically in Git and Codewalker. Tracks per-layout receipts, respects caps, verifies queued restores, and skips stale/reparented siblings.
 - `backend.py`: Python 3.10+ standard library, read-only Git subprocesses, and transactional SQLite review storage. It also provides the documented JSON CLI and agent instructions via `skill`.
 - `mod.json`: focusable mod, `place: none`, and a tiny `launch: true` popup used only to toggle the review pane/panel. Direct pane copies use `framed: true`. `review.svg` and `icons/` provide the artwork; Lucide attribution is in `icons/LICENSE`.
 
-Herdr APIs include `props`, `spaces`, `panes`, `focused`, `agents`, `exec`, `hc`, `appHome`, `theme`, `settings`, `watchFolder`, `nextCommand`, `layout`, `shared`, `setShared`, `run`, `notify`, and `closeOverlay`. Commands include pane split/close/focus and layout show/hide/select. A `toolbar: true` copy draws a Review button for a compatible personal panel stack; no layout is shipped or installed.
+Herdr APIs include `props`, `spaces`, `panes`, `focused`, `agents`, `exec`, `hc`, `appHome`, `theme`, `settings`, `watchFolder`, `nextCommand`, `layout`, `shared`, `setShared`, `run`, `notify`, and `closeOverlay`. Commands include pane split/close/focus and layout show/hide/select/resize. A `toolbar: true` copy draws a Review button for a compatible personal panel stack; no layout is shipped or installed.
 
 Other mods open a review with:
 
@@ -68,6 +70,7 @@ Branch mode accepts `base`; uncommitted is the default. Use an explicit local ch
 - Copy the whole runtime folder, including `backend.py`. `backend/codewalker.py` at the repository root is only a legacy source-checkout compatibility entry point. Do not copy only the JavaScript or require the source repository at runtime.
 - Names are case-insensitive on common macOS filesystems. Do not overwrite an existing `Codewalker`/`codewalker`. A deliberate rename also requires updating mod names, self-opening calls, icon/helper paths, and external Git-mod integration; the optional installer does not perform that adaptation.
 - The key popup is not a review window. Use pane props or explicit non-launch overlay dimensions. Never copy a shipped tab-bar/layout to add Review; integrate into a personal layout instead.
+- `run()` queues layout commands. Keep an expansion receipt until the restored layout is observed; never spin redraws while waiting. Expansion must not use `layout.set`, replace a mod node, or alter its props: those changes can rewrite personal files or recreate the editor.
 - Hidden `herdr-app check` verifies initial native descriptions/materialization, not painting, scrolling, pointer behavior, or later asynchronous states. Screenshot fixtures must not read a real checkout, write its store, or send to real agents.
 
 ## Done when

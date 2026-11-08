@@ -2,6 +2,7 @@ import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
 import { props, spaces, panes, focused, agents, hc, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
 import { ReviewClient, HUMAN } from "./client.js";
+import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
 import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, sendText, utf8Bytes, markdownBody } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
@@ -15,7 +16,9 @@ const COMPARISON_FIELDS = ["root", "reviewId", "snapshotId", "revision", "branch
 // Git's object/log writes never change a review; everything else may.
 const GIT_NOISE = /\/\.git\/(?:objects|logs)\//;
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const ICON = Object.fromEntries(["git-branch", "plus", "message", "refresh", "folder", "x", "check", "pencil", "reply", "trash", "send"].map(name => [name, `mods/Codewalker/icons/${name}.svg`]));
+const ICON = Object.fromEntries(["git-branch", "plus", "message", "refresh", "folder", "x", "check", "pencil", "reply", "trash", "send", "maximize-2", "minimize-2"].map(name => [name, `mods/Codewalker/icons/${name}.svg`]));
+const REVIEW_DOCK = { panel: "panel", stack: "panel-body", child: "review" };
+const panelExpander = dockExpand({ layout, run, shared, setShared });
 // Icons are Lucide (ISC), written by scripts/lucide_icons.py; see icons/LICENSE.
 // Diff columns: old and new line numbers, the hover comment button, the +/− sign.
 const MARK_W = 22, SIGN_W = 16, ROW_H = 22;
@@ -67,6 +70,10 @@ function reviewPanel() {
 }
 
 function toggleReviewPanel(on) {
+  if (on && panelExpander.state(REVIEW_DOCK).expanded) {
+    const error = panelExpander.restore();
+    if (error) { notify({ title: "Could not restore panel", body: error, level: "error" }); return; }
+  }
   if (on) run("layout.hide", { id: "panel" });
   else { run("layout.select", { stack: "panel-body", child: "review" }); run("layout.show", { id: "panel" }); }
 }
@@ -199,6 +206,7 @@ export default class Codewalker extends View {
         const command = await nextCommand();
         if (command === "focus") this.handle.focus();
         if (command === "refresh") this.refresh(cx);
+        if (command === "expand") this.toggleExpansion(cx);
         cx.notify();
       }
     });
@@ -223,7 +231,48 @@ export default class Codewalker extends View {
       .on_click((_event, cx) => { if (enabled) action(cx); }).child(body);
   }
 
+  expansionState() {
+    if (this.toolbar || this.framed || props()?.overlay || !reviewPanel()?.on) return null;
+    return panelExpander.state(REVIEW_DOCK);
+  }
+
+  watchExpansion(cx) {
+    this.expansionTimer?.cancel();
+    this.expansionTimer = cx.timer.after(RESTORE_TIMEOUT + 250, cx => {
+      this.expansionTimer = null;
+      panelExpander.reconcile();
+      const error = panelExpander.state(REVIEW_DOCK).error;
+      if (error) this.error = error;
+      cx.notify();
+    });
+  }
+
+  reconcileExpansion(cx) {
+    if (this.expansionChecking || !panelExpander.needsReconcile()) return;
+    this.expansionChecking = true;
+    cx.spawn(async cx => {
+      try {
+        const outcome = panelExpander.reconcile();
+        if (outcome === "restored") { this.expansionTimer?.cancel(); this.expansionTimer = null; }
+        else if (outcome === "timeout") this.error = panelExpander.state(REVIEW_DOCK).error;
+        else if (outcome) this.watchExpansion(cx);
+      } finally { this.expansionChecking = false; }
+      // Shared state and layout changes already redraw us. In particular, do
+      // not notify for "waiting": commands may not have reached Herdr yet.
+    });
+  }
+
+  toggleExpansion(cx) {
+    const state = this.expansionState();
+    if (!state?.supported || state.restoring || state.reason === "at-max") return;
+    const error = state.expanded ? panelExpander.restore() : panelExpander.expand(REVIEW_DOCK, "Codewalker");
+    if (error) this.error = error;
+    this.watchExpansion(cx);
+    cx.notify();
+  }
+
   async close() {
+    this.expansionTimer?.cancel();
     this.draftTimer?.cancel();
     if (this.intent && this.composer.value().trim()) {
       try { await this.client.saveDraft(this.intent.context ?? this.context(), this.intent, this.composer.value()); }
@@ -1264,6 +1313,7 @@ export default class Codewalker extends View {
 
   render(cx) {
     if (this.launcher) return div();
+    if (this.toolbar || (!this.framed && !props()?.overlay)) this.reconcileExpansion(cx);
     if (this.toolbar) return reviewButton();
     // Following focus can save a draft and reread, which notifies; render may not.
     if (!this.fixed) {
@@ -1272,6 +1322,10 @@ export default class Codewalker extends View {
     }
     this.settleJump();
     const t = theme(), width = this.width, wide = width >= SPLIT_W, compact = width < COMPACT_W;
+    const expansion = this.expansionState();
+    const expandLabel = expansion?.restoring ? "Restoring panel…" : expansion?.expanded ? "Restore panel width"
+      : expansion?.reason === "at-max" ? `Already at the layout's maximum width (${expansion.max}px)`
+      : expansion?.mode === "max" ? `Widen to the layout's maximum (${expansion.max}px)` : "Expand to fill the workspace";
     const sideW = width >= 1000 ? 280 : 240, diffW = wide ? width - sideW : width, num = compact ? 34 : 46;
     this.cols = { num, inset: compact ? 12 : num * 2 + MARK_W, edge: compact ? 10 : 16 };
     const currentThreads = this.threads.filter(thread => thread.path === this.file);
@@ -1412,7 +1466,11 @@ export default class Codewalker extends View {
           { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `All discussions · ${openCount} open` }))
         .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
         .when(this.mode === "send" || sendable(this.threads).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
-        .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving }))))
+        .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving })))
+        .when(Boolean(expansion?.supported), el => el.child(this.button("expand-review", "", cx => this.toggleExpansion(cx), {
+          icon: ICON[expansion.expanded ? "minimize-2" : "maximize-2"], tooltip: expandLabel, selected: expansion.expanded,
+          enabled: !expansion.restoring && expansion.reason !== "at-max",
+        }))))
       .when(pickingBase, el => el.child(h_flex().min_h(40).flex_none().px(14).py(7).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().h(26).px(8).rounded(6).bg(t.background).border_1().border_color(t.input).cursor_text().on_mouse_down("left", stop)
             .flex_1().min_w(0)

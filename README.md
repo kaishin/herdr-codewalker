@@ -124,6 +124,16 @@ Keep the IDs **`panel`**, **`panel-body`**, and **`review`** exactly as shown: C
 
 Save your personal layout, then click **Review** to show or hide the panel. The button adds `"review"` to the shared `workspace.panels` list, so the shipped tabs mod remembers it per space. The `mod.open:Codewalker` key now toggles this panel instead of a pane. Review follows the focused terminal's local checkout. No pinned folder or personal path is needed.
 
+### Expand and restore the panel
+
+Use the expand icon in Review's top toolbar to give the docked panel more room. Use the restore icon to return to its previous width. The same review stays mounted, so the selected diff and drafts remain in place.
+
+Expansion respects your layout's `max` width. With a cap, it widens the panel up to that cap; without one, it hides the panel's visible siblings and fills their row. To allow full workspace width, remove `max` from the `panel` node in **your own** layout. Codewalker never edits layout files to remove limits. The top tab bar and app sidebar remain available.
+
+For a keyboard binding, use the `Codewalker.expand` action in your own `keys.json`; no binding is installed. `herdr-app do Codewalker.expand` invokes the same toggle on a visible docked Review. Pane and overlay copies ignore it.
+
+Git and Codewalker share the expanded-panel state, so either can restore the same panel. Closing the panel restores the workspace. Expansion uses Herdr's saved layout clicks and shared state; no review data is moved or copied.
+
 ## Review flow
 
 1. Open Review (see above). It shows the checkout of the pane it opened beside. Drag the pane edge to widen it: below 760 px the changed files sit above the diff, wider they sit side by side. To review another local checkout, choose the folder button beside the scope controls, enter its absolute path and choose **Open**. There is no folder/file browser.
@@ -170,7 +180,7 @@ Herdr mods are trusted code with the user's process permissions. This package ru
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-node --experimental-vm-modules --test tests/test_ui.mjs
+node --experimental-vm-modules --test tests/*.mjs
 python3 scripts/check-ui.py  # synthetic populated inline/retained/composer states
 python3 scripts/install.py --prepare integration --check
 ```
