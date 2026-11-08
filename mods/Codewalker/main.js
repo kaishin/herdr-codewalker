@@ -1255,7 +1255,7 @@ export default class Codewalker extends View {
 
   emptyState(title, body, spinning = false) {
     const t = theme();
-    return v_flex().p(24).gap(6)
+    return v_flex().px(14).py(12).gap(6)
       .child(h_flex().gap(8).items_center()
         .when(spinning, el => el.child(div().w(12).text_size(12).text_color(t.muted).frames(SPIN, 90).child(SPIN[0])))
         .child(div().font_semibold().text_size(13).child(title)))
