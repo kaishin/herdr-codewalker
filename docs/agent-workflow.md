@@ -7,7 +7,7 @@ Codewalker is a local Python 3 CLI shared with the native Herdr review mod. No P
 Replace the three paths below. `FILE` must be in the selected diff; this is not a file browser. Arguments remain separate argv entries, including JSON and paths with spaces.
 
 ```sh
-CW="$HOME/.config/herdr-app/mods/Codewalker/backend.py"  # installed copy; or <project>/backend/codewalker.py
+CW="$HOME/.config/herdr-app/mods/Codewalker/backend.py"  # installed copy; or <project>/mods/Codewalker/backend.py
 REPO=/absolute/path/to/checkout
 FILE=src/example.py
 cw() { python3 "$CW" --repo "$REPO" "$@" --json; }

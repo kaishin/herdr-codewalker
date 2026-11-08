@@ -1,11 +1,11 @@
 # Codewalker local CLI protocol v1
 
-Implementation owner: backend worker; files `backend/codewalker.py`, `tests/test_backend.py`, `pyproject.toml`, `docs/protocol.md`. Native UI owns its own adapter. Python 3 stdlib only, SQLite transactions, no daemon/network. This document is the implementation contract.
+Implementation owner: backend worker; files `mods/Codewalker/backend.py`, `tests/test_backend.py`, `pyproject.toml`, `docs/protocol.md`. Native UI owns its own adapter. Python 3 stdlib only, SQLite transactions, no daemon/network. This document is the implementation contract.
 
 ## Invocation and envelope
 
 ```text
-python3 <absolute-project>/backend/codewalker.py --repo <explicit-folder> <command> --json [options]
+python3 <absolute-project>/mods/Codewalker/backend.py --repo <explicit-folder> <command> --json [options]
 ```
 
 Arguments are argv entries, never a shell string. `--repo` accepts a folder inside a Git worktree and resolves its canonical root. `--json` is accepted for every command; output is always JSON, except `skill`: it prints Markdown for agents (how to answer review threads, with the helper path and an optional `--repo` filled in), needs no review and never touches the store. `open` (in a Herdr terminal) opens Review as a pane right of that terminal, for `--repo` or the current folder; it returns `{pane, folder, scope}` with the newly created pane ID. `open --scope commit --commit <ref>` validates the local commit before changing the layout, passes the full SHA to the pane and also returns `commitOid`. `open --scope branch --base <ref>` selects a branch comparison. `open` requires a local Herdr terminal; other mods can use `pane.split` directly with the props below. Global `--store <absolute-db-path>` is an optional test/backup override. Default DB: OS user-data directory (`~/Library/Application Support/herdr-codewalker/reviews.sqlite3` on macOS; `$XDG_DATA_HOME/herdr-codewalker/reviews.sqlite3` or `~/.local/share/herdr-codewalker/reviews.sqlite3` elsewhere). Never put canonical data in overlay localStorage/cache. No tracked-source/index mutations.

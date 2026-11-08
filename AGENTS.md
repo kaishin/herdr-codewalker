@@ -7,3 +7,10 @@ The user has requested that Codewalker changes always be installed after validat
 - Check `herdr-app status`, capture `herdr-app shot`, and inspect the image. Do not claim interaction testing unless performed.
 - Keep the installer's collision and local-edit checks. If installation is blocked, report the blocker; do not bypass it or overwrite local edits.
 - Do not change unrelated mods, layouts, settings, or keybindings. Installation does not authorize committing or pushing.
+
+## Distribution
+
+- `mods/Codewalker/` must work when copied alone. Keep all runtime helpers and assets there; `backend/codewalker.py` is only the legacy source-checkout CLI/import shim.
+- Maintain the root `RECIPE.md` and `preview.png`. Never include real repository paths, private code, or user conversations in public screenshots.
+- Use `scripts/preview.py` for the non-writing native demo and reproducible artwork. Coordinate live capture slots with other Herdr agents; close only the preview you opened.
+- Preparing distribution files does not authorize publishing, committing, or pushing.

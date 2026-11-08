@@ -371,6 +371,29 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(self.source_digest(), before)
         self.assertFalse(marker.exists(), "Repository-configured executable ran")
 
+    def test_copied_mod_reviews_commits_without_the_source_checkout_or_installer(self):
+        # The public distribution boundary is the folder, not the build script.
+        copied = self.base / "download" / "mods" / "Codewalker"
+        shutil.copytree(HELPER.parent.parent / "mods/Codewalker", copied,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        helper = copied / "backend.py"
+        env = {**self.env, "PYTHONPATH": ""}
+        result = subprocess.run(
+            [sys.executable, str(helper), "--repo", str(self.repo), "--store", str(self.store),
+             "review", "--scope", "commit", "--commit", "HEAD", "--file", PATH],
+            cwd=self.base, env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        review = json.loads(result.stdout)["data"]
+        self.assertEqual(review["commitOid"], self.git("rev-parse", "HEAD"))
+        rows = review["file"]["hunks"][0]["rows"]
+        self.assertIn("old value", [row["text"] for row in rows])
+        self.assertNotIn("new value", [row["text"] for row in rows], "working-tree changes are not the selected commit")
+        skill = subprocess.run([sys.executable, str(helper), "skill", "--repo", str(self.repo)],
+                               cwd=self.base, env=env, capture_output=True, text=True, check=True).stdout
+        self.assertIn(str(helper), skill, "agent instructions must point to the distributed helper")
+        self.assertNotIn(str(HELPER), skill)
+
     def test_installer_is_plan_only_preserves_edits_and_rejects_receipt_escape(self):
         scratch = self.base / "fixture" / "home"
         (scratch / "layouts").mkdir(parents=True)

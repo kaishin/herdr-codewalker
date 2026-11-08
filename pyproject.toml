@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,12 +8,16 @@ version = "0.1.0"
 description = "Native Herdr change review and durable local annotations"
 requires-python = ">=3.10"
 dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
 
 [project.scripts]
-codewalker = "backend.codewalker:main"
+codewalker = "codewalker_runtime.backend:main"
 
 [tool.setuptools]
-packages = ["backend"]
+packages = ["codewalker_runtime"]
+package-dir = {codewalker_runtime = "mods/Codewalker"}
+include-package-data = false
 
 # No installation required:
 # python3 -m unittest discover -s tests -p 'test_*.py' -v

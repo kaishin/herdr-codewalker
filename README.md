@@ -2,6 +2,8 @@
 
 Native code review for Herdr: uncommitted, branch and single-commit diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
 
+![Codewalker: native diff review with an inline human–agent discussion](preview.png)
+
 ## Requirements and boundaries
 
 - Installed Herdr desktop with the native mod APIs; verified against `herdr-app 0.1.12` on macOS.
@@ -11,37 +13,42 @@ Native code review for Herdr: uncommitted, branch and single-commit diffs, old/n
 - Commit review compares **first parent → selected commit**, or empty tree → root commit. Both sides come from Git objects; the index and working tree are excluded. Merge commits use their first parent, not a combined diff.
 - Review shows the folder of the pane it opened beside (or `--repo`); never the space's display name. The folder button’s tooltip shows the resolved checkout and branch. Confirm that root before commenting.
 
-## Prepare and validate without changing your app
+## Install
 
-From this checkout:
+Codewalker follows Herdr's folder-based mod format. **`mods/Codewalker/` is self-contained**: JavaScript, icons, and the Python helper are all included. No build, package manager, or custom installer is required.
+
+1. Download or clone this repository. Read [RECIPE.md](RECIPE.md) and the [data/access notes](#data-and-access) before running trusted mod code.
+2. Copy `mods/Codewalker/` to `${HERDR_APP_HOME:-~/.config/herdr-app}/mods/Codewalker/`. Keep `RECIPE.md` and `preview.png` outside the app home. Do not merge into an occupied folder or overwrite a shipped/local mod.
+3. Check the installed mod:
+
+   ```sh
+   herdr-app check "${HERDR_APP_HOME:-$HOME/.config/herdr-app}/mods/Codewalker"
+   ```
+
+Herdr loads the files on save; no restart is needed. Installation adds no layouts, settings, keybindings, or agents. A custom `HERDR_APP_HOME` must be the home of the Herdr instance you intend to update.
+
+### Optional checked installer
+
+For collision detection and later updates, this repository also provides a helper. **This is a project convenience, not a Herdr package manager.**
 
 ```sh
-# Read-only plan; refuses occupied names or local edits.
-python3 scripts/install.py
+python3 scripts/install.py                 # read-only plan
+python3 scripts/install.py --apply --check # install/update only owned files
+```
 
-# Build a private package in this project. Does not install or activate it.
+It accepts `--home /absolute/app-home` or `HERDR_APP_HOME`, defaults to `~/.config/herdr-app`, and records installed hashes in `codewalker-install.json`. It refuses unknown/local edits and symlinked destinations/ancestors. Settings, keys, other mods, layouts, layout state, and review data stay untouched. Replacement is atomic per file, not a multi-file transaction. Do not delete the receipt to bypass a collision.
+
+A folder installed by copying has no receipt: the helper deliberately refuses to take it over. To update it manually, compare the new version with the installed folder, back up your copy, and replace it only after accounting for local changes. To remove Codewalker, remove its mod folder and any key/layout references you added; its review database is kept separately.
+
+Earlier project installers also installed `mods/codewalker-tabs` and a `codewalker` layout. The helper removes those only when their owned hashes match; switch away from that legacy layout first.
+
+### Prepare a separate package
+
+```sh
 python3 scripts/install.py --prepare integration --check
 ```
 
-`--check` **executes** the authored mods in Herdr's hidden initial-render checker. It does not prove layout, painting, scrolling, focus, asynchronous states, or interactions. On macOS, `/tmp` and `/var` are symlinks; use an explicit canonical path for a scratch destination (for example `/private/tmp/codewalker-check`).
-
-The package includes:
-
-- `mods/Codewalker/`: native review and a packaged copy of `backend/codewalker.py` named `backend.py`.
-- `codewalker-install.json`: owned-file hashes used to refuse collisions and local edits on later runs.
-
-## Install only after approval
-
-These steps change app-home files; they are **not** performed as part of research or project checks.
-
-```sh
-# Copy into the default ~/.config/herdr-app.
-python3 scripts/install.py --apply --check
-```
-
-`--home /absolute/app-home` or `HERDR_APP_HOME` selects a different app home. The default is `~/.config/herdr-app`. Never target another person's app home. The installer refuses symlinked write destinations/ancestors and unknown or locally modified target files. It does not write `settings.json` or `keys.json`, and leaves shipped mods and layouts, `.state/`, and review data untouched. No occupied private name is overwritten without a matching owned-file receipt. Installation is preflighted and atomic **per file**, not a cross-file transaction; an interrupted install may need inspection before retry. Do not delete the receipt to bypass a collision.
-
-Earlier versions also installed a tab-bar copy (`mods/codewalker-tabs`) and a `codewalker` layout. The installer removes them when they are unchanged; switch to another layout first if `codewalker` is active.
+This writes a self-contained mod and an ownership receipt under `integration/`, without touching the live app. `--check` executes the mod in Herdr's hidden initial-render checker; it does not test paint, scrolling, focus, or interaction. Use canonical scratch paths on macOS, for example `/private/tmp/codewalker-check`, rather than symlinked `/tmp`.
 
 ### Open Review
 
@@ -132,10 +139,10 @@ Long text diffs are paged at 240 rendered rows to keep actual inline editors/but
 See [`docs/agent-workflow.md`](docs/agent-workflow.md) for copyable agent commands and [`docs/protocol.md`](docs/protocol.md) for the exact JSON contract, optimistic revision checks, actor attribution, limits, and recovery rules. Native behavior and the pending manual checklist are in [`docs/ux.md`](docs/ux.md).
 
 ```sh
-python3 /absolute/herdr-codewalker/backend/codewalker.py \
+python3 /absolute/herdr-codewalker/mods/Codewalker/backend.py \
   --repo /absolute/checkout review --scope uncommitted --json
 
-python3 /absolute/herdr-codewalker/backend/codewalker.py \
+python3 /absolute/herdr-codewalker/mods/Codewalker/backend.py \
   --repo /absolute/checkout list --json
 ```
 
@@ -157,3 +164,15 @@ python3 scripts/install.py --prepare integration --check
 ```
 
 The UI tests exercise async draft/navigation/post state; independent acceptance tests exercise actual CLI/SQLite/Git and lost-response/restart deduplication. Native initial/eager render checks pass for the review mod. Do not treat a hidden `check` as visual or interaction verification.
+
+## Distribution assets
+
+[RECIPE.md](RECIPE.md) describes the shipped behavior and rebuild requirements. [Preview documentation](docs/preview.md) records the synthetic native screenshot, composition, and reproduction commands. The preview uses demo data, not a private checkout or agent transcript.
+
+Publication requires a public GitHub repository containing this package and the `herdr-mod` topic. Herdr's guide says eligible packages appear in the [community gallery](https://herdr.dev/mods/) within the hour; indexing is not guaranteed. Verify the live catalog after publication.
+
+## License
+
+Codewalker is [MIT licensed](LICENSE), copyright © 2026 Reda Lemeden. The self-contained mod folder includes a copy of the license.
+
+Third-party assets retain their own terms: [Lucide/Feather icons](mods/Codewalker/icons/LICENSE) use ISC/MIT; the Inter font used only for preview artwork uses [SIL OFL 1.1](docs/preview-assets/INTER-LICENSE.txt).

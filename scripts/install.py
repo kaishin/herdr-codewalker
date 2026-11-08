@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan/install the private Codewalker Review mod without editing shipped files or user settings."""
+"""Plan/install the Codewalker Review mod without editing shipped files or user settings."""
 from __future__ import annotations
 
 import argparse
@@ -42,7 +42,6 @@ def regular_tree(folder):
 def prepare():
     """The Review mod with its packaged Python backend. Nothing else."""
     runtime = regular_tree(PROJECT / MOD)
-    runtime["backend.py"] = (PROJECT / "backend/codewalker.py").read_bytes()
     return {f"{MOD}/{name}": data for name, data in runtime.items()}
 
 
