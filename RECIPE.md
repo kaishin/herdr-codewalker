@@ -1,6 +1,6 @@
 # Codewalker
 
-Review a local checkout without leaving Herdr. Read uncommitted, branch, or single-commit diffs; mark files as viewed; and keep questions and agent replies attached to the exact lines. Comments reach an agent only when the reviewer chooses **Send**.
+Review a checkout without leaving Herdr, on this computer or on another Herdr machine. Read uncommitted, branch, or single-commit diffs; mark files as viewed; and keep questions and agent replies attached to the exact lines. Comments reach an agent only when the reviewer chooses **Send**.
 
 ![Codewalker](preview.png)
 
@@ -32,15 +32,15 @@ The gallery preview uses a real native render with documented synthetic data. It
 - Drafts autosave after 300ms and before navigation/posting. A failed save keeps the current text and review. Escape or Close keeps a draft; Discard deletes it. Cmd/Ctrl+Enter submits. Escape also cancels a drag, delete confirmation, or message edit before leaving the discussions/send view.
 - Viewed is explicit, never inferred from opening or scrolling. Marks survive restarts and match each file's content, paths, status, and modes. Unrelated edits preserve them; changes to that file make it unviewed. Hide viewed does not close the selected diff or discard its draft.
 - Checkout/store folder watches trigger a debounced refresh; a 15-second timer covers missed events. Git object/log noise and recent local draft writes are ignored. Refresh does not overwrite editor text.
-- Send targets only the selected ready agent. Working or blocked agents cannot receive it. Delivery is recorded as uncertain before `hc send --if idle`, then sent after confirmation. A refusal clears the record; an unclear outcome stays uncertain until the reviewer checks the agent's chat. Ordinary sends do not duplicate previously sent comments.
-- Without a pinned folder/space, Review follows the focused terminal's checkout, or the active space's folder. It saves a draft before following. Remote checkouts are rejected before any local helper execution.
+- Send targets only the selected agent while Review shows it Ready (idle or done). That check is made at the click, not atomically when hc types: herdr-core then still refuses a blocked agent and waits for a person's draft, but an agent that started working in between gets the text. Delivery is recorded as uncertain before a plain `hc send` (no `--if`, never `--force`), run through `exec("hc", args, { timeout: 600000 })` because hc holds a send while someone types there and `hc()` stops after 30 s. It is recorded as sent after confirmation. A refusal that herdr-core marks as before typing (exit code and its error kind, or the hint "nothing was typed") clears the record; a missing confirmation stays uncertain until the reviewer checks the agent's chat. Ordinary sends do not duplicate previously sent comments.
+- Without a pinned folder/space, Review follows the focused terminal's checkout, or the active space's folder. It saves a draft before following. In a remote space it reviews that machine's checkout: every helper call runs there (`exec` with `on`), with that machine's own helper and store. It never reads the same path on this computer instead. A typed folder stays on the machine in view.
 
 ## Built from
 
 `mods/Codewalker/` is the complete runtime folder:
 
 - `main.js`: GPUI `View`, native gpui-base layout, buttons, checkboxes, inputs, text areas, and Markdown text; navigation, draft lifecycle, file watches, bounded caches, and agent delivery.
-- `client.js`: argv-only `exec("python3", ...)` calls to the adjacent `backend.py`, read normalization, serialized mutations, revision tracking, and persisted post receipts.
+- `client.js`: argv-only `exec("python3", ...)` calls to the adjacent `backend.py`, or with `{ on }` to a helper already installed on the checkout's machine (found and version-checked with `hello`); read normalization, serialized mutations, machine-qualified revision tracking, and persisted post receipts.
 - `model.js`: diff/anchor, discussion, formatting, and delivery-text helpers.
 - `dock-expand.js`: shared expansion/restore controller, bundled identically in Git and Codewalker. Tracks per-layout receipts, respects caps, verifies queued restores, and skips stale/reparented siblings.
 - `backend.py`: Python 3.10+ standard library, read-only Git subprocesses, and transactional SQLite review storage. It also provides the documented JSON CLI and agent instructions via `skill`.
@@ -57,7 +57,7 @@ run("pane.split", {
 });
 ```
 
-Branch mode accepts `base`; uncommitted is the default. Use an explicit local checkout and live target pane. This creates a separate review and keeps existing panes/drafts. Bare `mod.open Codewalker` is a toggle, not the comparison API.
+Branch mode accepts `base`; uncommitted is the default. Use an explicit checkout and live target pane; add `on: <machine>` for a checkout on another machine, else the folder is on this computer. This creates a separate review and keeps existing panes/drafts. Bare `mod.open Codewalker` is a toggle, not the comparison API.
 
 ## Watch out
 
@@ -67,6 +67,7 @@ Branch mode accepts `base`; uncommitted is the default. Use an explicit local ch
 - Text previews have per-file, total-byte, changed-path, and output limits. Over-limit or unsupported files keep metadata and old discussion evidence. Do not make up line anchors. The protocol documents the precise bounds and platform argument-size limitations.
 - Review identity remains scoped to the canonical worktree and checked-out branch. Selecting a historical commit does not change that identity. Historical comments identify their commit so agents can inspect current code before acting.
 - Save exact mutation IDs/envelopes before uncertain writes. Repeating a command must not duplicate a discussion or delivery. Checkout, revision, and snapshot conflicts are distinct failures.
+- Another machine needs its own `backend.py` (`~/.local/share/herdr-codewalker/backend.py`, or its own current Codewalker mod), Python 3.10+ and Git. Never upload or update that helper from the mod; show the person the `hc file write --on` command. Never send this computer's helper path, store path or review revision to another machine: the same path and branch there has the same review ID. A remote checkout has no folder watch; refresh on a timer, after writes and on agent status changes there. Offer Send only to agents on the checkout's machine.
 - Copy the whole runtime folder, including `backend.py`. `backend/codewalker.py` at the repository root is only a legacy source-checkout compatibility entry point. Do not copy only the JavaScript or require the source repository at runtime.
 - Names are case-insensitive on common macOS filesystems. Do not overwrite an existing `Codewalker`/`codewalker`. A deliberate rename also requires updating mod names, self-opening calls, icon/helper paths, and external Git-mod integration; the optional installer does not perform that adaptation.
 - The key popup is not a review window. Use pane props or explicit non-launch overlay dimensions. Never copy a shipped tab-bar/layout to add Review; integrate into a personal layout instead.

@@ -2,6 +2,10 @@
 
 Codewalker is a local Python 3 CLI shared with the native Herdr review mod. No Pi extension, daemon, MCP server, browser, or chat scraping is needed. Commands read Git; only the separate annotation database is written. They do not stage files, submit chat, or post PR comments.
 
+## Checkouts on another machine
+
+Run these commands on the machine that has the checkout. Its helper is at `~/.local/share/herdr-codewalker/backend.py` or in that machine's own Codewalker mod; the feedback a reviewer sends you names the exact path. The store is on that same machine. Do not use a helper or store on another computer for it, also when the same path exists there. `python3 <helper> hello --json` reports the helper's path, version and default store.
+
 ## 1. Pin the checkout and read a changed file
 
 Replace the three paths below. `FILE` must be in the selected diff; this is not a file browser. Arguments remain separate argv entries, including JSON and paths with spaces.

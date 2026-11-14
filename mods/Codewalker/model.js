@@ -113,7 +113,12 @@ export function uncertainCount(threads) {
   return threads.filter(thread => thread.messages.some(message => isHuman(message) && message.delivery?.state === "uncertain")).length;
 }
 
-const quote = text => `'${String(text).replaceAll("'", "'\\''")}'`;
+// The agents an unconfirmed send went to, as their addresses ("studio/t16d").
+export function unconfirmedTargets(threads) {
+  return [...new Set(threads.flatMap(thread => thread.messages).filter(message => isHuman(message) && message.delivery?.state === "uncertain").map(message => message.delivery.target).filter(Boolean))].join(", ");
+}
+
+export const quote = text => `'${String(text).replaceAll("'", "'\\''")}'`;
 
 // The text pasted into the agent: each discussion with its code and messages,
 // then the command that prints how to answer in a thread.

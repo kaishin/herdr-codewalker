@@ -76,6 +76,21 @@ def check_siblings(spec, *names):
     assert all(len(line) - len(line.lstrip()) >= level for line in lines[found[0]:found[-1]] if line.strip()), f"{names} must share one row"
 
 
+def check_thread_header(spec, thread, open):
+    """A thread header wraps instead of clipping; only an open card has a divider under it."""
+    lines = spec.splitlines()
+    at = next(i for i, line in enumerate(lines) if f':id[Str("thread-header-{thread}")]' in line)
+    header, depth = lines[at], len(lines[at]) - len(lines[at].lstrip())
+    groups = [line for line in lines[at + 1:at + 40] if len(line) - len(line.lstrip()) == depth + 2]
+    groups = groups[:2]
+    assert header.lstrip().startswith("h_flex ") and " .flex_wrap" in header, "The thread header wraps; a fixed row clips Show/Hide and Reopen in a narrow panel"
+    assert " .flex_wrap" in groups[0] and " .min_w[Number(0.0)]" in groups[0] and " .flex_basis" in groups[0], "Labels wrap and shrink inside their own group"
+    assert " .flex_none" in groups[1] and " .ml_auto" in groups[1], "Actions keep their size and move to their own line together"
+    body = "\n".join(lines[at:at + 40])
+    assert body.index(f'Button "status-{thread}"') > body.index(groups[1].strip()), "Resolve or Reopen sits in the action group"
+    assert (" .border_b[" in header) == open, "Only an open card draws a divider under its header"
+
+
 def main():
     # Source is the reviewed authored module; no downloaded helpers or live app configuration.
     with tempfile.TemporaryDirectory(prefix="codewalker-native-fixture-") as temp:
@@ -98,14 +113,29 @@ def main():
         branch = 'this.width = 368; this.height = 900; this.source = "branch"; this.base = "main"; this.baseInput.set_value("main");'
         commit = 'this.width = 368; this.height = 900; this.source = "commit"; this.commitOid = "0123456789abcdef"; this.commitParents = 2; this.commitInput.set_value("HEAD~1");'
         cached = 'this.width = 368; this.height = 900; this.rememberComparison(); this.resetContext({keepComparisons:true}); this.restoreComparison(); this.reading = true;'
+        # A checkout on another machine. Nothing here starts a process on it.
+        remote = 'this.width = 368; this.height = 900; this.on = "synthetic-machine";'
         expandable = 'this.width = 368; this.expansionState = () => ({supported:true, expanded:false, mode:"fill"});'
         expanded = 'this.width = 1100; this.expansionState = () => ({supported:true, expanded:true, mode:"fill"});'
-        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit)):
+        # A resolved discussion outside the shown lines, opened; then none outside, with long labels.
+        unfolded = 'this.width = 300; this.height = 900; this.expanded.add("synthetic-outdated");'
+        inside = 'this.width = 300; this.height = 900; this.threads = [{...this.threads[0], awaitingReply:true}];'
+        # Folded, the count is the only sign of a long thread; its messages are not rendered.
+        crowded = 'this.width = 300; this.height = 900; this.threads[1] = {...this.threads[1], awaitingReply:true, messages:Array.from({length:128}, (_, i) => ({...this.threads[1].messages[0], id:`synthetic-old-${i}`}))};'
+        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit), ("null", remote), ("null", unfolded), ("null", inside), ("null", crowded)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
-            narrow = extra in (expandable, docked, viewed, hidden, branch, commit, cached)
+            narrow = extra in (expandable, docked, viewed, hidden, branch, commit, cached, remote, unfolded, inside, crowded)
+            if extra not in (listing, sending):
+                outside = '"Discussions outside the shown lines"' in spec
+                assert outside == (extra != inside), "Only a thread with no shown line is listed outside the shown lines"
+                check_thread_header(spec, "synthetic-thread", True)
+                if outside:
+                    check_thread_header(spec, "synthetic-outdated", extra == unfolded)
+                    assert ('"1 message"' in spec) == (extra not in (unfolded, crowded)) and ('"128 messages"' in spec) == (extra == crowded), "A folded card names its message count"
+                    assert f'Button "toggle-synthetic-outdated"' in spec and ('"Hide"' in spec) == (extra == unfolded), "A resolved card offers Show, then Hide"
             lines = spec.splitlines()
             root = next(i for i, line in enumerate(lines) if ':id[Str("codewalker")]' in line)
             assert ':id[Str("review-controls")]' in lines[root + 1], "Scope and actions are the first row; no title row above them"
@@ -115,6 +145,7 @@ def main():
                 check_siblings(spec, 'Button "refresh"', 'Button "toggle-discussions"', 'Button "choose-checkout"', 'Button "open-send"', 'Button "expand-review"')
                 assert f"icons/{'minimize-2' if extra == expanded else 'maximize-2'}.svg" in spec
                 assert ("Restore panel width" if extra == expanded else "Expand to fill the workspace") in spec
+            assert ("synthetic-machine · 1 file" in spec) == (extra == remote), "A remote review names its machine beside the counts"
             assert 'text "HEAD → working tree' not in spec, "Comparison explanation belongs in a tooltip, not a text row"
             assert ('Button "apply-base"' in spec) == (extra == branch), "Branch comparison keeps an explicit base editor"
             assert 'Button "scope-commit"' in spec, "Commit is the third scope"
@@ -174,7 +205,7 @@ def main():
             assert ('"Comment on lines 1–2"' in spec) == (extra == hover), "A range comment names its lines"
             assert '"Ask for a short reply"' in spec, "Every open composer offers a short-reply request"
             assert ("edit-synthetic-human" in spec) == (extra not in (editing, deleting)) and "edit-synthetic-agent" not in spec, "Only your own messages offer Edit"
-            assert ('"Awaiting reply"' in spec) == (extra == docked), "A thread owed a reply says so"
+            assert ('"Awaiting reply"' in spec) == (extra in (docked, inside, crowded)), "A thread owed a reply says so"
             # Resolve carries a check mark; a checked reply request adds one more.
             assert spec.count("icons/check.svg") == 1 + (extra == docked) + (2 if extra == viewed else 1 if extra == hidden else 0), "Resolve and a checked request show a check mark"
             if not extra:

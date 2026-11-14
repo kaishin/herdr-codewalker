@@ -1,9 +1,9 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { props, spaces, panes, focused, agents, hc, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
-import { ReviewClient, HUMAN } from "./client.js";
+import { props, spaces, panes, focused, agents, exec, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
+import { ReviewClient, HUMAN, machineOf } from "./client.js";
 import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
-import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, sendText, utf8Bytes, markdownBody } from "./model.js";
+import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
 // Recently viewed diffs for the current snapshot only; bounded by files and rows.
@@ -25,6 +25,9 @@ const MARK_W = 22, SIGN_W = 16, ROW_H = 22;
 // Docked beside the agent, Review stacks files above the diff. Wider, they sit side by side.
 const SPLIT_W = 760, COMPACT_W = 560;
 
+// Ids and addresses on another machine carry its name ("vps/t7"); ones here do not.
+const idMachine = id => typeof id === "string" && id.includes("/") ? id.split("/")[0] : null;
+
 // Like Changes: the focused terminal's folder, else the active space's. Focus
 // in a mod (Review itself) has no folder; then only a space switch moves it.
 function location(shownSpace) {
@@ -32,13 +35,22 @@ function location(shownSpace) {
   if (!space) return null;
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
   const cwd = pane?.cwd || f?.cwd || null;
-  const on = f?.pane === null && cwd ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space.machine ?? null;
+  const on = f?.pane === null && cwd ? idMachine(f.terminal) : space.machine ?? null;
   const folder = cwd ?? (space.id !== shownSpace ? space.folder : null);
   return folder ? { space: space.id, folder, on, key: JSON.stringify([folder, on]) } : null;
 }
-// hc send exit codes that refuse before typing anything: not_found,
-// needs_target, blocked, status_mismatch, finished. Anything else is unclear.
-const REFUSED = new Set([3, 7, 9, 10, 11]);
+// hc send refusals that herdr-core (0.1.21) raises before typing, as exit code
+// and the error kind it prints; both must match. The core also marks a refusal
+// with the hint "nothing was typed" (e.g. unavailable: still starting).
+// Anything else, including exit 130 (a cancel prints no kind) and a send
+// without an answer, may have been typed: confirmation is missing.
+const REFUSED = new Map([[3, "not_found"], [4, "machine_unknown"], [6, "invalid_params"], [7, "needs_target"], [9, "blocked"], [10, "status_mismatch"], [11, "finished"]]);
+// hc send holds while a person types in that terminal (draft_wait, 60 s by
+// default, counted from their last key, so it has no fixed end) and a remote
+// send waits while the line is alive. hc() stops after 30 s; give the app's
+// maximum. Stopping hc cancels a send that was not typed yet, but one already
+// typed stays: a timeout is never proof either way.
+const SEND_TIMEOUT_MS = 600000;
 const SEND_WARN_BYTES = 8192;
 const READY = new Set(["idle", "done"]);
 const within = (folder, root) => folder === root || folder.startsWith(root.endsWith("/") ? root : `${root}/`);
@@ -50,7 +62,7 @@ function toggleReviewPane() {
   if (!here) return;
   const open = all.find(p => p.mod === "Codewalker" && p.tab === here.tab);
   if (open) return run("pane.close", { pane: open.pane });
-  run("pane.split", { direction: "right", pane: here.pane, mod: "Codewalker", props: { framed: true, ...(here.cwd ? { folder: here.cwd } : {}) } });
+  run("pane.split", { direction: "right", pane: here.pane, mod: "Codewalker", props: { framed: true, ...(here.cwd ? { folder: here.cwd, ...(idMachine(here.pane) ? { on: idMachine(here.pane) } : {}) } : {}) } });
 }
 
 function findNode(node, id) {
@@ -125,7 +137,9 @@ export default class Codewalker extends View {
     this.spaceId = here?.space ?? space?.id ?? null;
     this.followed = here?.key ?? null;
     this.folder = p.folder ?? here?.folder ?? space?.folder ?? "";
-    this.on = p.on ?? here?.on ?? space?.machine ?? null;
+    // A pinned folder is on this computer unless `on` names its machine: the
+    // active space at start must never choose where a stored path is read.
+    this.on = (p.on !== undefined ? p.on : p.folder ? null : here ? here.on : space?.machine) || null;
     this.askReply = false;
     // Public pane/layout props: folder, scope, base (branch), commit (commit).
     this.source = p.scope ?? "uncommitted";
@@ -168,7 +182,7 @@ export default class Codewalker extends View {
     this.contextVersion = 0;
     this.handle = cx.focus_handle();
     this.client = new ReviewClient({ helper: p.helper ?? `${appHome()}/mods/Codewalker/backend.py` });
-    this.rootInput = InputState.new({ placeholder: "Absolute path of a local Git checkout", value: this.folder });
+    this.rootInput = InputState.new({ placeholder: "Absolute path of a Git checkout", value: this.folder });
     this.baseInput = InputState.new({ placeholder: "Base ref, e.g. main", value: this.base });
     this.commitInput = InputState.new({ placeholder: "Commit SHA or ref, e.g. HEAD~1", value: this.commitRef || "HEAD" });
     this.commitInput.on("change", (_event, cx) => cx.notify());
@@ -400,6 +414,7 @@ export default class Codewalker extends View {
 
   // Like Herdr's Changes sidebar: refresh when the checkout changes, and when
   // the discussion store changes so agent replies appear without polling.
+  // Another machine has no folder watch: see watchAgents and the 15-second timer.
   watch(cx, root, storePath) {
     if (this.on) return;
     const store = storePath ? storePath.slice(0, storePath.lastIndexOf("/")) : null;
@@ -423,13 +438,24 @@ export default class Codewalker extends View {
     }
   }
 
+  // Stands in for the store watch on another machine: when an agent there
+  // starts or finishes a turn, it may have replied or edited code.
+  watchAgents(cx) {
+    if (!this.on || !this.reviewId) return;
+    const seen = agents().filter(agent => idMachine(agent.address) === this.on).map(agent => `${agent.address}:${agent.status}`).join(" ");
+    if (this.agentsSeen !== undefined && this.agentsSeen !== seen) cx.spawn(async cx => this.soon(cx));
+    this.agentsSeen = seen;
+  }
+
   soon(cx) {
     if (this.soonTimer) return;
     this.soonTimer = cx.timer.after(500, cx => { this.soonTimer = null; this.refresh(cx, true); });
   }
 
+  // A late answer from another machine must not move this review's revision:
+  // the same path and branch there has the same review ID.
   wrote(result) {
-    if (result?.reviewId === this.reviewId && Number.isInteger(result.revision)) this.revision = Math.max(this.revision ?? 0, result.revision);
+    if ((result?.machine ?? null) === this.on && result?.reviewId === this.reviewId && Number.isInteger(result.revision)) this.revision = Math.max(this.revision ?? 0, result.revision);
   }
 
   // Mark only the diff actually displayed, never the newer list's fingerprint
@@ -509,13 +535,16 @@ export default class Codewalker extends View {
   changeRoot(cx) {
     const folder = this.rootInput.value();
     if (!folder.trim()) return;
-    if (!/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(folder)) { this.error = "Use an absolute local checkout path so review targeting does not depend on a shell's folder."; cx.notify(); return; }
-    if (folder === this.folder && !this.on) { this.editRoot = false; cx.notify(); return; }
+    if (!/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(folder)) { this.error = "Use an absolute checkout path so review targeting does not depend on a shell's folder."; cx.notify(); return; }
+    // A typed path is on the machine in view: the focused terminal's, else the active space's.
+    // It never moves a review to this computer by itself.
+    const on = this.fixed ? this.on : (location(null) ?? { on: this.on }).on;
+    if (folder === this.folder && on === this.on) { this.editRoot = false; cx.notify(); return; }
     this.withSavedDraft(cx, cx => {
       // Holds until focus moves to another folder.
       this.folder = folder;
       this.followed = location(this.spaceId)?.key ?? this.followed;
-      this.on = null;
+      this.on = on;
       this.editRoot = false;
       this.resetContext();
       this.refresh(cx);
@@ -580,6 +609,7 @@ export default class Codewalker extends View {
     this.soonTimer?.cancel();
     this.soonTimer = null;
     this.watched = new Set();
+    this.agentsSeen = undefined;
     this.cache.clear();
     this.pendingFile = null;
     this.rowsSnapshot = null;
@@ -800,7 +830,7 @@ export default class Codewalker extends View {
       try {
         const saved = await this.client.saveDraft(context, intent, body);
         this.wrote(saved);
-        if (this.intent?.id === intent.id && this.composer.value() === body) this.draftStatus = body.trim() ? "Draft saved locally" : "";
+        if (this.intent?.id === intent.id && this.composer.value() === body) this.draftStatus = body.trim() ? (this.on ? `Draft saved on ${this.on}` : "Draft saved locally") : "";
       } catch (error) { if (this.intent?.id === intent.id) this.draftStatus = `Draft not saved: ${readableError(error)}`; }
       cx.notify();
     });
@@ -809,7 +839,11 @@ export default class Codewalker extends View {
   restoreDraft(draft, cx) {
     if (this.cachedComparison) return;
     this.withSavedDraft(cx, cx => {
-      this.intent = draft.intent ?? { id: draft.id, path: draft.path, anchor: draft.anchor, threadId: draft.threadId };
+      // A draft belongs to the machine whose store returned it, whatever name an
+      // earlier viewer had for that machine. Its writes and saved post go there only.
+      const here = context => context ? { ...context, on: this.on } : context;
+      const saved = draft.intent ?? { id: draft.id, path: draft.path, anchor: draft.anchor, threadId: draft.threadId };
+      this.intent = { ...saved, context: here(saved.context), ...(saved.pendingPost ? { pendingPost: { ...saved.pendingPost, context: here(saved.pendingPost.context) } } : {}) };
       const receipt = this.intent.pendingPost;
       this.postAttempt = receipt ? { context: receipt.context, intent: this.intent, body: receipt.payload.body, commandId: receipt.commandId } : null;
       this.composer.set_value(draft.body);
@@ -931,7 +965,8 @@ export default class Codewalker extends View {
   // then the active tab, then the most recent.
   candidates() {
     const f = focused(), space = f?.space ?? spaces().find(s => s.active)?.id;
-    return agents().filter(agent => agent.space === space).map(agent => {
+    // Only agents on the checkout's machine: its paths, helper and store exist there only.
+    return agents().filter(agent => agent.space === space && idMachine(agent.address) === this.on).map(agent => {
       const cwd = panes().find(pane => pane.pane === agent.pane)?.cwd ?? null;
       return { ...agent, cwd, here: Boolean(this.root && cwd && within(cwd, this.root)), sameTab: agent.tab === f?.tab };
     }).sort((a, b) => (b.here - a.here) || (b.sameTab - a.sameTab) || (b.seq - a.seq));
@@ -950,42 +985,81 @@ export default class Codewalker extends View {
     if (this.mode !== "send") this.backMode = this.mode;
     this.mode = "send";
     this.sendAgain = false;
-    this.sendNotice = null;
+    if (!this.sending) this.sendNotice = null;
     cx.notify();
   }
 
   // "uncertain" is recorded before typing, "sent" after; a refusal clears it.
   // A lost answer stays uncertain until the person checks the agent's chat.
+  // The send can wait minutes: its outcome changes this view only while the
+  // same checkout is shown; otherwise a notification tells it.
   send(cx) {
     const target = this.target(), items = sendable(this.threads, { again: this.sendAgain });
-    if (this.cachedComparison || !target || !READY.has(target.status) || !items.length || this.sending || !this.reviewId) return;
-    const ids = items.flatMap(item => item.messageIds), context = this.context();
-    const text = sendText({ items, root: this.root, branch: this.branch, helper: this.client.helper, note: this.sendNote.value() });
-    const name = target.program?.name ?? target.title ?? target.address;
+    const context = this.context(), helper = this.client.helperPath(context);
+    if (this.cachedComparison || !target || !READY.has(target.status) || !items.length || this.sending || !this.reviewId || !helper || idMachine(target.address) !== this.on) return;
+    const ids = items.flatMap(item => item.messageIds), note = this.sendNote.value(), version = this.contextVersion;
+    const text = sendText({ items, root: this.root, branch: this.branch, helper, note });
+    const name = target.program?.name ?? target.title ?? "the agent", who = `${name} (${target.address})`;
+    const count = `${items.length} ${items.length === 1 ? "discussion" : "discussions"}`;
+    // Plain hc send (accepted by the user): when it types, herdr-core still refuses a
+    // blocked agent (a prompt or dialog; never --force) and waits for a person's draft.
+    // --if idle is not used: the app's "idle" also covers a seen finished turn, whose
+    // core word is "done", and --if has no idle-or-done. Review's Ready check (idle or
+    // done) is made before the click and is not atomic: the agent can start working
+    // before hc types, and then gets the text while working.
+    const args = ["send", "--json", target.address, text];
+    const here = () => version === this.contextVersion;
+    const finish = (state, message) => {
+      if (here()) this.sendNotice = { state, error: message };
+      else notify({ title: state === "refused" ? "Not sent" : "Confirmation missing", body: message, level: "warning" });
+    };
     this.sending = true;
-    this.sendNotice = null;
+    this.sendNotice = { state: "sending", target: target.address, name };
     cx.spawn(async cx => {
       try {
         try { this.wrote(await this.client.deliver(context, ids, "uncertain", target.address, newId())); }
-        catch (error) { this.sendNotice = { error: `Nothing was sent: ${readableError(error)}` }; return; }
+        catch (error) { finish("refused", `Not sent to ${who}: the review store could not record it (${readableError(error)}). Nothing was typed.`); return; }
         let result;
-        try { result = await hc(["send", "--json", "--if", "idle", target.address, text]); }
-        catch (error) { this.sendNotice = { error: `Delivery is unclear (${readableError(error)}). Check ${name}'s chat.` }; return; }
+        try { result = await exec("hc", args, { timeout: SEND_TIMEOUT_MS }); }
+        catch (error) {
+          const message = error?.message ?? String(error);
+          if (/^cannot run /.test(message)) { // hc did not start: nothing can have been typed.
+            try { this.wrote(await this.client.deliver(context, ids, "none", target.address, newId())); } catch { /* Stays uncertain: the person can check. */ }
+            finish("refused", `Not sent to ${who}: ${message}. Nothing was typed.`);
+            return;
+          }
+          const cause = /took longer than/.test(message) ? `no answer after ${SEND_TIMEOUT_MS / 60000} minutes` : readableError(error);
+          finish("unconfirmed", `No confirmation from ${who}: ${cause}. It may have arrived. Check that chat before you send again.`);
+          return;
+        }
         if (result.code !== 0) {
-          const reason = (() => { try { return JSON.parse(result.stderr || result.stdout).error?.message; } catch { return null; } })() ?? `hc exited ${result.code}`;
-          if (!REFUSED.has(result.code)) { this.sendNotice = { error: `Delivery is unclear (${reason}). Check ${name}'s chat.` }; return; }
+          const failure = (() => { try { return JSON.parse(result.stderr || result.stdout).error ?? null; } catch { return null; } })();
+          const reason = failure?.message ?? `hc exited ${result.code}`;
+          if (!(failure?.kind && REFUSED.get(result.code) === failure.kind) && !/^nothing was typed/.test(failure?.hint ?? "")) {
+            finish("unconfirmed", `No confirmation from ${who}: ${reason}. It may have arrived. Check that chat before you send again.`);
+            return;
+          }
           try { this.wrote(await this.client.deliver(context, ids, "none", target.address, newId())); } catch { /* Stays uncertain: the person can check. */ }
-          this.sendNotice = { error: `Not sent: ${reason}.` };
+          finish("refused", `Not sent to ${who}: ${reason}. Nothing was typed.`);
           return;
         }
         try { this.wrote(await this.client.deliver(context, ids, "sent", target.address, newId())); }
-        catch (error) { this.sendNotice = { error: `Sent to ${name}, but not recorded (${readableError(error)}). It shows as unclear.` }; return; }
-        this.sendNote.set_value("");
+        catch (error) { finish("unconfirmed", `Delivered to ${who}, but not recorded (${readableError(error)}). It shows as unconfirmed; choose It arrived.`); return; }
+        notify({ title: "Delivered to agent", body: `${count} to ${who}` });
+        if (!here()) return;
+        this.sendNotice = null;
+        if (this.sendNote.value() === note) this.sendNote.set_value("");
         this.sendAgain = false;
-        this.mode = this.backMode ?? "files";
-        notify({ title: "Sent to agent", body: `${items.length} ${items.length === 1 ? "discussion" : "discussions"} to ${name}` });
-        run("pane.focus", { terminal: target.address });
-      } finally { this.sending = false; this.refresh(cx, true); cx.notify(); }
+        if (this.mode === "send") {
+          this.mode = this.backMode ?? "files";
+          run("pane.focus", { terminal: target.address });
+        }
+      } finally {
+        this.sending = false;
+        if (this.sendNotice?.state === "sending") this.sendNotice = null;
+        this.refresh(cx, true);
+        cx.notify();
+      }
     });
     cx.notify();
   }
@@ -1018,22 +1092,34 @@ export default class Codewalker extends View {
     return h_flex().min_h(34).px(12).gap(8).items_center().border_b(1).border_color(t.border).children(children);
   }
 
+  // A header that wraps instead of clipping: labels wrap inside the first
+  // group, and the actions take their own line when the labels would get
+  // less than 140px. Short headers stay on one line.
+  wrapHeader(info, actions) {
+    return h_flex().flex_wrap().gap_x(8).gap_y(4).items_center()
+      .child(h_flex().flex_grow(1).flex_basis(140).min_w(0).flex_wrap().gap_x(8).gap_y(4).items_center().children(info))
+      .child(h_flex().flex_none().ml_auto().gap(8).items_center().children(actions));
+  }
+
   threadCard(thread, cx, orphan = false) {
     const t = theme(), outdated = threadIsOutdated(thread), resolved = thread.status === "resolved";
     // Resolved discussions fold to one line until opened; history is never removed.
     const open = !resolved || this.expanded.has(thread.id), count = thread.messages.length;
     const toggle = cx => { if (this.expanded.has(thread.id)) this.expanded.delete(thread.id); else this.expanded.add(thread.id); cx.notify(); };
+    // The divider belongs to the open body; a folded card has none under its header.
     return v_flex().id(`thread-${thread.id}`).ml(orphan ? 12 : this.cols.inset).mr(this.cols.edge).my(6).rounded(8).border_1().border_color(this.focusThread === thread.id ? t.accent : t.border).bg(t.surface).text_size(12).overflow_hidden()
-      .child(this.cardHeader(t, [
-        svg(ICON.message).size(13).flex_none().text_color(resolved ? t.dim : t.muted),
-        div().flex_none().font_semibold().text_color(resolved ? t.muted : t.foreground).child(anchorLabel(thread.anchor)),
-        div().flex_none().px(6).py(1).rounded(4).text_size(10).bg(resolved ? t.raised : tint(t.accent, 0x26)).text_color(resolved ? t.muted : t.accent).child(resolved ? "Resolved" : "Open"),
-        ...(thread.awaitingReply ? [div().flex_none().px(6).py(1).rounded(4).text_size(10).bg(tint(t.working, 0x26)).text_color(t.working).child("Awaiting reply")] : []),
-        ...(outdated ? [this.pill("Code changed since", t.ansi1)] : orphan ? [div().flex_none().text_size(11).text_color(t.blocked).child("Outside this page")] : []),
-        div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(open ? "" : `${count} ${count === 1 ? "message" : "messages"}`),
+      .child(this.wrapHeader([
+        h_flex().min_w(0).gap(8).items_center()
+          .child(svg(ICON.message).size(13).flex_none().text_color(resolved ? t.dim : t.muted))
+          .child(div().min_w(0).truncate().font_semibold().text_color(resolved ? t.muted : t.foreground).child(anchorLabel(thread.anchor))),
+        resolved ? this.tag("Resolved", t.muted, t.raised) : this.tag("Open", t.accent),
+        ...(thread.awaitingReply ? [this.tag("Awaiting reply", t.working)] : []),
+        ...(outdated ? [this.tag("Code changed since", t.ansi1)] : orphan ? [div().min_w(0).truncate().text_size(11).text_color(t.blocked).child("Outside this page")] : []),
+        ...(open ? [] : [div().min_w(0).truncate().text_size(11).text_color(t.dim).child(`${count} ${count === 1 ? "message" : "messages"}`)]),
+      ], [
         ...(resolved ? [this.button(`toggle-${thread.id}`, open ? "Hide" : "Show", toggle, { small: true, ghost: true })] : []),
         this.button(`status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.cachedComparison && !this.saving }),
-      ]))
+      ]).id(`thread-header-${thread.id}`).min_h(34).px(12).py(6).when(open, el => el.border_b(1).border_color(t.border)))
       .when(open && outdated && Boolean(thread.anchor?.snippet), el => el.child(div().px(12).py(8).border_b(1).border_color(t.border).bg(t.background).font_family(settings().font_family).text_size(11).text_color(t.muted)
         .child(Array.isArray(thread.anchor.snippet) ? thread.anchor.snippet.join("\n") : thread.anchor.snippet)))
       .when(open, el => el.child(v_flex().px(12).py(10).gap(12).children(thread.messages.map((message, index) => this.messageView(message, "message", index === 0))))
@@ -1087,6 +1173,11 @@ export default class Codewalker extends View {
     return div().flex_none().px(6).py(1).rounded(4).text_size(10).bg(tint(color, 0x26)).text_color(color).child(text);
   }
 
+  // A pill for a wrapping header: it truncates rather than overflow.
+  tag(text, color, bg = tint(color, 0x26)) {
+    return div().min_w(0).truncate().px(6).py(1).rounded(4).text_size(10).bg(bg).text_color(color).child(text);
+  }
+
   // Every discussion, by file: the first comment, replies indented under it.
   discussionsView(cx) {
     const t = theme(), compact = this.width < COMPACT_W;
@@ -1127,11 +1218,13 @@ export default class Codewalker extends View {
   sendView() {
     const t = theme(), list = this.candidates(), target = this.target(list), unclear = uncertainCount(this.threads);
     const items = sendable(this.threads, { again: this.sendAgain });
-    const text = items.length ? sendText({ items, root: this.root, branch: this.branch, helper: this.client.helper, note: this.sendNote.value() }) : "";
-    const bytes = utf8Bytes(text), ready = Boolean(target) && READY.has(target.status);
+    const helper = this.client.helperPath(this.context());
+    const text = items.length && helper ? sendText({ items, root: this.root, branch: this.branch, helper, note: this.sendNote.value() }) : "";
+    const bytes = utf8Bytes(text), ready = Boolean(target) && Boolean(helper) && READY.has(target.status);
     const status = agent => READY.has(agent.status) ? ["Ready", t.idle] : agent.status === "working" ? ["Working", t.working] : agent.status === "blocked" ? ["Needs you", t.blocked] : [agent.status, t.dim];
-    const why = !items.length ? (unclear ? "Nothing new. Check the unclear send below." : "Nothing new to send. Comments you write are sent once.")
-      : !target ? (list.length ? "Choose an agent." : "No agent in this space. Start one, then come back.")
+    const why = !items.length ? (unclear ? "Nothing new. Check the unconfirmed send above." : "Nothing new to send. Comments you write are sent once.")
+      : !helper ? "The review helper on that machine has not answered yet. Refresh, then come back."
+      : !target ? (list.length ? "Choose an agent." : this.on ? `No agent on ${this.on} in this space. Start one there, then come back.` : "No agent in this space. Start one, then come back.")
       : !ready ? `${target.program?.name ?? "The agent"} is ${status(target)[0].toLowerCase()}. Send when it is ready; prompts are never answered for you.` : "";
     const section = text => div().px(14).pt(14).pb(6).text_size(11).font_semibold().text_color(t.dim).child(text);
     return v_flex().flex_1().min_h(0).min_w(0)
@@ -1141,10 +1234,10 @@ export default class Codewalker extends View {
         .child(this.button("close-send", "", cx => { this.mode = this.backMode ?? "files"; cx.notify(); }, { small: true, ghost: true, icon: ICON.x, tooltip: "Back" })))
       .child(v_flex().id("review-send").flex_1().min_h(0).overflow_y_scrollbar().pb(16)
         .when(unclear > 0, el => el.child(v_flex().mx(14).mt(12).p(10).gap(8).rounded(8).border_1().border_color(tint(t.blocked, 0x66)).bg(tint(t.blocked, 0x14))
-          .child(div().text_size(12).text_color(t.blocked).child(`${unclear} ${unclear === 1 ? "discussion was" : "discussions were"} sent, but delivery is unclear. Check the agent's chat first.`))
+          .child(div().text_size(12).text_color(t.blocked).child(`Delivery unconfirmed for ${unclear} ${unclear === 1 ? "discussion" : "discussions"} to ${unconfirmedTargets(this.threads) || "an agent"}. It may have arrived. Check that agent's chat, then choose.`))
           .child(h_flex().gap(6)
             .child(this.button("mark-arrived", "It arrived", cx => this.markArrived(cx), { small: true, icon: ICON.check, enabled: !this.cachedComparison && !this.sending }))
-            .child(this.button("send-again", this.sendAgain ? "Included below" : "I checked · Send again", cx => { this.sendAgain = !this.sendAgain; cx.notify(); }, { small: true, selected: this.sendAgain, enabled: !this.sending })))))
+            .child(this.button("send-again", this.sendAgain ? "Included below" : "It is not there · Send again", cx => { this.sendAgain = !this.sendAgain; cx.notify(); }, { small: true, selected: this.sendAgain, enabled: !this.sending })))))
         .child(section("Agent"))
         .child(v_flex().px(8).gap(1)
           .children(list.map(agent => {
@@ -1169,15 +1262,16 @@ export default class Codewalker extends View {
           .child(text || "Nothing to send.")))
       .child(h_flex().flex_none().px(14).py(10).gap(8).items_center().border_t(1).border_color(t.border)
         .child(div().flex_1().min_w(0).text_size(11).text_color(this.sendNotice?.error ? t.blocked : t.dim)
-          .child(this.sendNotice?.error ?? (why || "Pastes into the agent only when it is idle.")))
+          .child(this.sendNotice?.state === "sending" ? `Sending to ${this.sendNotice.name} (${this.sendNotice.target}). If someone is typing in that terminal, it waits until they stop.`
+            : this.sendNotice?.error ?? (why || "Pastes and submits when the agent is ready. It never answers a prompt, and it waits while someone types there.")))
         .child(this.button("send-to-agent", this.sending ? "Sending…" : "Send", cx => this.send(cx), { small: true, primary: true, icon: ICON.send, enabled: !this.cachedComparison && !this.sending && ready && items.length > 0 })));
   }
 
   // Toolbar Send: shown while there is something new (or unclear) to send, and in the Send view.
   sendButton() {
     const count = sendable(this.threads).length, on = this.mode === "send";
-    return this.button("open-send", this.width < COMPACT_W ? "" : count ? `Send ${count}` : "Unclear", cx => { if (on) { this.mode = this.backMode ?? "files"; cx.notify(); } else this.openSend(cx); },
-      { primary: count > 0 && !on, selected: on, icon: ICON.send, label: "Send to agent", tooltip: on ? "Back" : count ? `Send ${count} new ${count === 1 ? "discussion" : "discussions"} to an agent` : "A send is unclear; check it" });
+    return this.button("open-send", this.width < COMPACT_W ? "" : count ? `Send ${count}` : "Unconfirmed", cx => { if (on) { this.mode = this.backMode ?? "files"; cx.notify(); } else this.openSend(cx); },
+      { primary: count > 0 && !on, selected: on, icon: ICON.send, label: "Send to agent", tooltip: on ? "Back" : count ? `Send ${count} new ${count === 1 ? "discussion" : "discussions"} to an agent` : "A send has no confirmation; check the agent" });
   }
 
   discussionItem(thread) {
@@ -1186,13 +1280,15 @@ export default class Codewalker extends View {
     const lines = String(thread.anchor?.snippet ?? "").split("\n"), last = thread.messages.at(-1);
     const toggle = cx => { if (this.expanded.has(thread.id)) this.expanded.delete(thread.id); else this.expanded.add(thread.id); cx.notify(); };
     return v_flex().id(`discussion-${thread.id}`).px(14).py(10).gap(8).border_b(1).border_color(t.border).text_size(12)
-      .child(h_flex().gap(8).items_center()
-        .child(div().flex_none().font_semibold().text_color(resolved ? t.muted : t.foreground).child(anchorLabel(thread.anchor)))
-        .child(resolved ? div().flex_none().px(6).py(1).rounded(4).text_size(10).bg(t.raised).text_color(t.muted).child("Resolved") : this.pill("Open", t.accent))
-        .when(thread.awaitingReply === true, el => el.child(this.pill("Awaiting reply", t.working)))
-        .when(outdated, el => el.child(this.pill("Code changed since", t.ansi1)))
-        .child(div().flex_1().min_w(0).truncate().text_size(10).text_color(t.dim).child(open ? (last ? timestamp(last.createdAt) : "") : `${thread.messages.length} ${thread.messages.length === 1 ? "message" : "messages"}`))
-        .child(this.button(`list-status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.cachedComparison && !this.saving })))
+      .child(this.wrapHeader([
+        div().min_w(0).truncate().font_semibold().text_color(resolved ? t.muted : t.foreground).child(anchorLabel(thread.anchor)),
+        resolved ? this.tag("Resolved", t.muted, t.raised) : this.tag("Open", t.accent),
+        ...(thread.awaitingReply === true ? [this.tag("Awaiting reply", t.working)] : []),
+        ...(outdated ? [this.tag("Code changed since", t.ansi1)] : []),
+        div().min_w(0).truncate().text_size(10).text_color(t.dim).child(open ? (last ? timestamp(last.createdAt) : "") : `${thread.messages.length} ${thread.messages.length === 1 ? "message" : "messages"}`),
+      ], [
+        this.button(`list-status-${thread.id}`, resolved ? "Reopen" : "Resolve", cx => this.setStatus(thread, cx), { small: true, icon: resolved ? null : ICON.check, enabled: !this.cachedComparison && !this.saving }),
+      ]))
       .when(open && Boolean(lines[0]), el => el.child(v_flex().px(8).py(6).rounded(6).bg(t.surface).border_1().border_color(t.border)
         .font_family(settings().font_family).text_size(11).text_color(t.muted)
         .children(lines.slice(0, 3).map(line => div().truncate().child(line || " ")))
@@ -1320,6 +1416,7 @@ export default class Codewalker extends View {
       const here = location(this.spaceId);
       if (here && here.key !== this.followed && here.key !== this.following) cx.spawn(async cx => this.follow(cx));
     }
+    this.watchAgents(cx);
     this.settleJump();
     const t = theme(), width = this.width, wide = width >= SPLIT_W, compact = width < COMPACT_W;
     const expansion = this.expansionState();
@@ -1464,7 +1561,7 @@ export default class Codewalker extends View {
         .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
         .child(this.button("toggle-discussions", !compact && openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
           { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `All discussions · ${openCount} open` }))
-        .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
+        .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${this.on ? `${this.on}: ` : ""}${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
         .when(this.mode === "send" || sendable(this.threads).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
         .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving })))
         .when(Boolean(expansion?.supported), el => el.child(this.button("expand-review", "", cx => this.toggleExpansion(cx), {
@@ -1499,7 +1596,7 @@ export default class Codewalker extends View {
       .child(this.mode === "send" ? this.sendView() : this.mode === "discussions" ? this.discussionsView(cx) : (wide ? h_flex().items_stretch() : v_flex()).flex_1().min_h(0).min_w(0).child(navigator).child(diff))
       .child(h_flex().h(26).flex_none().px(14).gap(8).items_center().border_t(1).border_color(t.border).text_size(11)
         .child(div().size(6).flex_none().rounded_full().bg(this.error ? t.blocked : this.reading ? t.working : t.idle))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(this.on ? "Remote checkouts are not supported yet" : !this.reviewId ? "Not connected"
-          : [`${this.files.length} ${this.files.length === 1 ? "file" : "files"}`, `${openCount} open`, ...(awaiting ? [`${awaiting} awaiting reply`] : []), ...(draftCount ? [`${draftCount} ${draftCount === 1 ? "draft" : "drafts"}`] : [])].join(" · "))));
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(!this.reviewId ? (this.on ? `${this.on} · Not connected` : "Not connected")
+          : [...(this.on ? [this.on] : []), `${this.files.length} ${this.files.length === 1 ? "file" : "files"}`, `${openCount} open`, ...(awaiting ? [`${awaiting} awaiting reply`] : []), ...(draftCount ? [`${draftCount} ${draftCount === 1 ? "draft" : "drafts"}`] : [])].join(" · "))));
   }
 }

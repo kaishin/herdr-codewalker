@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -18,6 +19,12 @@ import threading
 import uuid
 
 VERSION = 1
+# Helper build, reported by `hello`. A Review on another machine checks it
+# before it uses this copy. Raise it when the UI needs newer helper behavior.
+HELPER_VERSION = 2
+# Optional protocol features a caller may use only when `hello` lists them.
+# "data-parts": repeated --data entries are joined into one mutation JSON.
+CAPABILITIES = ("data-parts",)
 # Store schema; 2 adds messages.reply_requested, 3 adds messages.edited_at and
 # message_edits (earlier bodies), 4 adds deliveries (what was sent to an agent).
 # 5 adds file_views (explicit, per-comparison viewed-file marks).
@@ -944,6 +951,14 @@ and docs/protocol.md in the herdr-codewalker repository.
 """
 
 
+def hello():
+    """What a Review on another machine checks before it uses this copy. No repository, no store access."""
+    return {"helper": os.path.abspath(__file__), "helperVersion": HELPER_VERSION,
+            "capabilities": list(CAPABILITIES),
+            "python": ".".join(str(part) for part in sys.version_info[:3]), "platform": sys.platform,
+            "git": shutil.which("git"), "home": str(Path.home()), "storePath": str(default_store())}
+
+
 def skill_text(repo):
     helper = os.path.abspath(__file__)
     shown = os.path.abspath(repo) if repo else "<checkout>"
@@ -1011,14 +1026,15 @@ def parse_args(argv):
     parser = Parser(description=__doc__)
     parser.add_argument("--repo")
     parser.add_argument("--store")
-    parser.add_argument("command", choices=["skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete"])
+    parser.add_argument("command", choices=["hello", "skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete"])
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch", "commit"])
     parser.add_argument("--base")
     parser.add_argument("--commit")
     parser.add_argument("--file")
     parser.add_argument("--select-first", action="store_true")
-    parser.add_argument("--data")
+    # Repeated --data entries are joined: one argument can be limited to 128 KiB.
+    parser.add_argument("--data", action="append")
     return parser.parse_args(argv)
 
 
@@ -1049,10 +1065,11 @@ def execute(args):
             return listing
         if args.data is None:
             fail("invalid_request", "mutation requires --data JSON")
-        if len(args.data.encode("utf-8")) > 1_048_576:
+        encoded = "".join(args.data)
+        if len(encoded.encode("utf-8")) > 1_048_576:
             fail("too_large", "mutation JSON exceeds 1 MiB")
         try:
-            data = json.loads(args.data, parse_constant=lambda value: fail("invalid_request", f"non-JSON constant: {value}"))
+            data = json.loads(encoded, parse_constant=lambda value: fail("invalid_request", f"non-JSON constant: {value}"))
         except (ValueError, RecursionError):
             fail("invalid_request", "--data is not valid JSON")
         return store.mutate(args.command, data)
@@ -1067,7 +1084,10 @@ def main(argv=None):
             # Plain Markdown for an agent to read, not a JSON result.
             print(skill_text(args.repo), end="")
             return 0
-        data = open_review(args.repo, args.scope, args.base, args.commit) if args.command == "open" else execute(args)
+        if sys.version_info < (3, 10):
+            fail("unsupported_python", "Codewalker needs Python 3.10 or newer", python=sys.version.split()[0])
+        data = (hello() if args.command == "hello"
+                else open_review(args.repo, args.scope, args.base, args.commit) if args.command == "open" else execute(args))
         result = {"ok": True, "protocolVersion": VERSION, "data": data}
         encoded = json.dumps(result, ensure_ascii=False)
         if len(encoded.encode("utf-8")) > MAX_OUTPUT:

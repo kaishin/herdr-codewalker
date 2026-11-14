@@ -1,6 +1,6 @@
 # Codewalker
 
-Native code review for Herdr: uncommitted, branch and single-commit diffs, old/new line discussions, and durable human–agent replies in one local SQLite store. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
+Native code review for Herdr: uncommitted, branch and single-commit diffs, old/new line discussions, and durable human–agent replies in one SQLite store on the checkout's machine. **Review** opens as a pane beside your agent, with a key or a CLI command, or in the side panel of a layout you own. No webview, external review TUI, file browser, staging or committing. Comments reach an agent only when you choose **Send**.
 
 ![Codewalker: native diff review with an inline human–agent discussion](preview.png)
 
@@ -10,7 +10,7 @@ Native code review for Herdr: uncommitted, branch and single-commit diffs, old/n
 
 - Installed Herdr desktop with the native mod APIs; verified against `herdr-app 0.1.12` on macOS.
 - Python 3.10+ standard library and Git. No npm runtime, database server, network service, API key, or downloaded helper.
-- Local checkouts only. A remote space is rejected before local execution; no accidental same-path local fallback.
+- Checkouts on this computer and on other Herdr machines (`hc machine ls`). A remote checkout is read by a helper that is already installed on that machine; see [Review a checkout on another machine](#review-a-checkout-on-another-machine). Review never reads the same path on this computer instead, and never copies code to another machine.
 - Branch review compares the selected local base's **merge-base → working tree**, including committed and uncommitted changes. No automatic fetch.
 - Commit review compares **first parent → selected commit**, or empty tree → root commit. Both sides come from Git objects; the index and working tree are excluded. Merge commits use their first parent, not a combined diff.
 - Review shows the folder of the pane it opened beside (or `--repo`); never the space's display name. The folder button’s tooltip shows the resolved checkout and branch. Confirm that root before commenting.
@@ -82,7 +82,7 @@ run("pane.split", {
 });
 ```
 
-`scope` defaults to `"uncommitted"`. `"branch"` accepts `base`; `"commit"` requires `commit`. These props also work in a layout block. Use an explicit `folder` to pin the checkout; remote execution remains unsupported. Bare `mod.open Codewalker` remains the existing key toggle and cannot take comparison arguments.
+`scope` defaults to `"uncommitted"`. `"branch"` accepts `base`; `"commit"` requires `commit`. These props also work in a layout block. Use an explicit `folder` to pin the checkout. A pinned folder is on this computer unless `on` names its machine (`on: "vps"`); the active space never decides. Bare `mod.open Codewalker` remains the existing key toggle and cannot take comparison arguments.
 
 From a local Herdr terminal:
 
@@ -122,7 +122,7 @@ The snippets below are fragments to merge into that copy, not replacement layout
 
 Keep the IDs **`panel`**, **`panel-body`**, and **`review`** exactly as shown: Codewalker uses them to find, select, and show the panel. Each ID must occur only once. The `panel` column and `panel-body` stack already exist in a copy of `main`; these fragments alone do not create them in an unrelated layout.
 
-Save your personal layout, then click **Review** to show or hide the panel. The button adds `"review"` to the shared `workspace.panels` list, so the shipped tabs mod remembers it per space. The `mod.open:Codewalker` key now toggles this panel instead of a pane. Review follows the focused terminal's local checkout. No pinned folder or personal path is needed.
+Save your personal layout, then click **Review** to show or hide the panel. The button adds `"review"` to the shared `workspace.panels` list, so the shipped tabs mod remembers it per space. The `mod.open:Codewalker` key now toggles this panel instead of a pane. Review follows the focused terminal's checkout and machine. No pinned folder or personal path is needed.
 
 ### Expand and restore the panel
 
@@ -136,13 +136,13 @@ Git and Codewalker share the expanded-panel state, so either can restore the sam
 
 ## Review flow
 
-1. Open Review (see above). It shows the checkout of the pane it opened beside. Drag the pane edge to widen it: below 760 px the changed files sit above the diff, wider they sit side by side. To review another local checkout, choose the folder button beside the scope controls, enter its absolute path and choose **Open**. There is no folder/file browser.
+1. Open Review (see above). It shows the checkout of the pane it opened beside. Drag the pane edge to widen it: below 760 px the changed files sit above the diff, wider they sit side by side. To review another checkout, choose the folder button beside the scope controls, enter its absolute path and choose **Open**. The path is read on the machine in view (the focused terminal's, else the active space's); the folder button's tooltip and the footer name a remote machine. There is no folder/file browser.
 2. Choose **Uncommitted**, **Branch** (enter a local base ref and choose **Compare**), or **Commit** (enter a SHA/ref such as `HEAD~1` and choose **Show**). Returning to a loaded mode shows its last diff immediately and refreshes in the background. Commit mode displays the resolved short SHA and stays pinned to it on refresh and mode switches. **Show** resolves the input again. Scope tooltips explain the comparisons.
 3. Select a changed path. Hover a line and press its **+**, or press an **old or new line number**. Drag across line numbers to select a range on one side; a range stays inside the hunk where it started. Shift-click extends an open comment's range.
 4. Write a multiline message and choose **Comment** / **Reply** (⌘/Ctrl+Enter). Choose **Edit** on your own message to change it in place (⌘/Ctrl+Enter saves, Esc cancels); it shows as edited and the store keeps the earlier text. **Delete** asks first; deleting your comment removes its whole thread, replies included, while deleting a reply removes only that reply. Check **Ask for a short reply** to have the agent answer in the thread in a few sentences, then go on with its work; the thread shows **Awaiting reply** until someone answers. Messages show Human/Agent attribution. Resolve/Reopen preserves all replies; resolved discussions fold to one line until shown.
 5. The 💬 button beside the scope controls (between Refresh and the folder button; the open count is in its tooltip and, when wide, its label) shows **Discussions**: every thread grouped by file, its code, the first comment and replies indented below. Filter by All, Open or Awaiting reply. **Show in diff** opens the file and starts the diff at the thread's hunk with its card marked; **Reply** does that and opens a reply. Esc or the button returns to the files.
-6. **Send n** (after the folder button, icon-only in narrow panels, when you have new comments) pastes your new comments into an agent: each open discussion (marked when its code changed since), with its code, messages and thread ID, then the `backend.py skill` command that tells the agent how to reply in the thread. Pick the agent (the focused one, else the only one in this checkout; agents in this space only), add a note, read the exact message, then **Send**. It types only when the agent is idle (`hc send --if idle`, never `--force`), so a permission prompt is never answered for you. Each comment is sent once: it is recorded as unclear before typing and as sent after. If the answer is lost, Review says so; check the agent's chat, then choose **It arrived** or **I checked · Send again**. Focus moves to the agent after a send.
-7. CLI/agent replies and code edits appear on their own: Review watches the checkout and the discussion store (15-second fallback), or choose Refresh. Refresh does not replace editor text. **Discussions on unchanged files** lists paths no longer in the diff; stale anchors keep their original context rather than silently moving.
+6. **Send n** (after the folder button, icon-only in narrow panels, when you have new comments) pastes your new comments into an agent: each open discussion (marked when its code changed since), with its code, messages and thread ID, then the `backend.py skill` command that tells the agent how to reply in the thread. Pick the agent (the focused one, else the only one in this checkout; agents in this space and on the checkout's machine only), add a note, read the exact message, then **Send**. Send is enabled only while the agent shows Ready (idle or done). It runs a plain `hc send`, never `--force`: when it types, herdr-core still refuses an agent that is blocked on a prompt or dialog, so a permission prompt is never answered for you. The Ready check happens when you click, not when hc types. If the agent starts working in between, it gets the text while it works; what it does with it then depends on the agent. While someone types in that terminal, hc holds the send (`draft_wait`, 60 s after their last key by default); the footer shows **Sending to … (address)** meanwhile, for up to 10 minutes. Each comment is sent once: it is recorded as unconfirmed before typing and as delivered after hc confirms. A refusal shows **Not sent** and nothing was typed. If hc does not confirm, Review shows **Delivery unconfirmed** with the address: the text may have arrived, so check that chat, then choose **It arrived** or **It is not there · Send again**. Review never sends again by itself. Focus moves to the agent after a delivery if Send is still open.
+7. CLI/agent replies and code edits appear on their own: Review watches the checkout and the discussion store (15-second fallback), or choose Refresh. A remote checkout has no folder watch: Review rereads every 15 seconds, after its own writes, and when an agent on that machine starts or finishes a turn. Refresh does not replace editor text. **Discussions on unchanged files** lists paths no longer in the diff; stale anchors keep their original context rather than silently moving.
 
 ### Viewed files
 
@@ -154,7 +154,36 @@ Drafts autosave after 300 ms and before navigation/posting. A save conflict keep
 
 Posts use durable idempotency receipts. If a helper response is lost, **Retry saved post** replays the original command, not a new message. The exact envelope is saved with the draft before dispatch, so restoring after a mod/app restart can recover the same attempt. A known accepted post is not retried because draft cleanup failed; cleanup is reported separately. This is deduplicated local mutation, not a claim of exactly-once external delivery.
 
-Long text diffs are paged at 240 rendered rows to keep actual inline editors/buttons within native event-lifetime rules. Binary, oversized and unsupported changes display metadata instead of fake line anchors. This first version is unified diff only; split view, syntax-highlight infrastructure, file editing, forge sync, and remote execution are out of scope.
+Long text diffs are paged at 240 rendered rows to keep actual inline editors/buttons within native event-lifetime rules. Binary, oversized and unsupported changes display metadata instead of fake line anchors. This first version is unified diff only; split view, syntax-highlight infrastructure, file editing and forge sync are out of scope.
+
+## Review a checkout on another machine
+
+Review follows the focused terminal into a remote space (`hc machine ls`). Git, the helper and the review store all run **on that machine**, through Herdr's `exec(..., { on })`. Comments, drafts, viewed marks and send records for a remote checkout are in that machine's own store, where agents on that machine use them with the same CLI. Nothing for a remote checkout is read from or written to this computer, also when the same path exists here.
+
+Requirements on the other machine: Python 3.10+ and Git on the PATH that Herdr uses there, and the helper file. Review looks for the helper in that user's home, in this order:
+
+1. `~/.local/share/herdr-codewalker/backend.py`
+2. `~/.config/herdr-app/mods/Codewalker/backend.py` (that machine's own Codewalker mod, if it is current)
+
+**Review never copies or updates the helper itself.** Install or update it yourself, from this computer:
+
+```sh
+hc file write --on <machine> .local/share/herdr-codewalker/backend.py \
+  < "${HERDR_APP_HOME:-$HOME/.config/herdr-app}/mods/Codewalker/backend.py"
+```
+
+This writes one Python file on that machine; it is trusted code that runs there as your user each time Review reads that checkout. Remove the file to remove it. Review reads the result of `python3 <helper> hello --json` before use and needs `helperVersion` 2 or newer.
+
+What Review shows when it cannot work, with no fallback to this computer:
+
+| Situation | Message |
+| --- | --- |
+| No helper file on the machine | Not installed, with the install command above |
+| Only a helper from another Codewalker version | Named with its path, with the same install command (the old file is left as it is) |
+| The machine is not connected, or has no `python3` | Cannot run python3 on the machine |
+| No Git, or Python older than 3.10 | Named as such |
+
+Limits: no remote folder watch (see Review flow, step 7). `backend.py open` works only on the computer that runs the Herdr window; from another mod, use `pane.split` with `props.on`. A draft's saved post is retried only on the machine whose store holds it. Each helper call is one new process on the other machine; a slow or broken connection shows an error and keeps the last diff, drafts and unsent text.
 
 ## Agents use the same store and CLI
 
@@ -168,13 +197,13 @@ python3 /absolute/herdr-codewalker/mods/Codewalker/backend.py \
   --repo /absolute/checkout list --json
 ```
 
-The installed copy exposes the identical CLI at `~/.config/herdr-app/mods/Codewalker/backend.py`. Mutations require `reviewId`, `expectedRevision`, a stable `commandId`, and actor metadata. Agents must call this API rather than edit SQLite or scrape a terminal. No agent is launched or authorized by the mod, and it contacts one only when you choose **Send**.
+The installed copy exposes the identical CLI at `~/.config/herdr-app/mods/Codewalker/backend.py`. For a checkout on another machine, an agent there uses that machine's helper and store; **Send** gives it the correct path. Mutations require `reviewId`, `expectedRevision`, a stable `commandId`, and actor metadata. Agents must call this API rather than edit SQLite or scrape a terminal. No agent is launched or authorized by the mod, and it contacts one only when you choose **Send**.
 
 ## Data and access
 
-The helper reads local Git metadata and bounded changed-file content. It writes only local review/draft state; source and index remain read-only. On macOS the default store is `~/Library/Application Support/herdr-codewalker/reviews.sqlite3`; other platforms use user-data paths documented in the protocol. Snippets and messages are not encrypted or synchronized. Back up the database using normal SQLite-safe procedures.
+The helper reads Git metadata and bounded changed-file content on the checkout's machine. It writes only review/draft state on that same machine; source and index remain read-only. On macOS the default store is `~/Library/Application Support/herdr-codewalker/reviews.sqlite3`; other platforms use user-data paths documented in the protocol. Snippets and messages are not encrypted or synchronized. Back up the database using normal SQLite-safe procedures.
 
-Herdr mods are trusted code with the user's process permissions. This package runs `python3` and Git locally; it does not call a model, reach the network, or update itself. **Send** pastes text into the agent terminal you choose, through `hc send --if idle`.
+Herdr mods are trusted code with the user's process permissions. This package runs `python3` and Git on this computer and, for a remote checkout, on that checkout's machine through herdr-core's existing connection (`exec` with `on`); it opens no connection of its own, does not call a model, and does not update itself or copy code to other machines. **Send** pastes text into the agent terminal you choose, through `hc send` (never `--force`).
 
 ## Verification
 
@@ -185,7 +214,7 @@ python3 scripts/check-ui.py  # synthetic populated inline/retained/composer stat
 python3 scripts/install.py --prepare integration --check
 ```
 
-The UI tests exercise async draft/navigation/post state; independent acceptance tests exercise actual CLI/SQLite/Git and lost-response/restart deduplication. Native initial/eager render checks pass for the review mod. Do not treat a hidden `check` as visual or interaction verification.
+The UI tests exercise async draft/navigation/post state, and remote routing with a simulated process bridge (per-machine helper discovery, no local fallback, same-path isolation); independent acceptance tests exercise actual CLI/SQLite/Git and lost-response/restart deduplication. Native initial/eager render checks pass for the review mod. Do not treat a hidden `check` as visual or interaction verification.
 
 ## Distribution assets
 

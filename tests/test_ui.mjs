@@ -51,7 +51,7 @@ async function modules(overrides = {}) {
   view.snapshotId = "snapshot-a";
   view.file = "a.txt";
   view.draftsLoaded = true;
-  view.client = { saveDraft: async () => ({ reviewId: "review-a", revision: 2 }), deleteDraft: async () => ({}), submit: async () => ({ thread: { id: "thread-a" } }), review: async () => review(), drafts: async () => [], file: async () => ({ rows: [] }), ...overrides.client };
+  view.client = { saveDraft: async () => ({ reviewId: "review-a", revision: 2 }), deleteDraft: async () => ({}), submit: async () => ({ thread: { id: "thread-a" } }), review: async () => review(), drafts: async () => [], file: async () => ({ rows: [] }), helperPath: () => "/app/mods/Codewalker/backend.py", ...overrides.client };
   view.intent = { id: "draft-a", path: "a.txt", anchor: { side: "new", startLine: 1, endLine: 1 }, snapshotId: "snapshot-a", context: view.context() };
   view.composer.set_value("Human question");
   async function drain() {
@@ -118,13 +118,214 @@ test("background refresh never replaces the active draft or its original review 
   assert.equal(view.reviewId, "review-branch-b");
 });
 
-test("remote context is rejected before any local helper execution", async () => {
-  let calls = 0;
+// Machines that share one checkout path and review ID. `machines[name]` is
+// { helper, capabilities?, revision, hello? }; "" is this computer.
+// `hello`: "missing" (no file), "old" (a helper without hello) or "down" (cannot start).
+function fakeMachines(machines) {
+  const calls = [];
+  const reply = (data, code = 0) => ({ code, stdout: JSON.stringify(data), stderr: "" });
+  const execute = async (command, args, options) => {
+    const name = options?.on ?? "", machine = machines[name];
+    calls.push({ command, args, on: options?.on ?? null });
+    if (!machine || machine.hello === "down") throw new Error(`machine ${name} is not connected`);
+    if (args[1] === "hello") {
+      if (machine.hello === "missing" || (name && !machine.helper.endsWith(args[0]))) return { code: 2, stdout: "", stderr: `python3: can't open file '/home/${args[0]}': [Errno 2] No such file or directory` };
+      if (machine.hello === "old") return reply({ ok: false, protocolVersion: 1, error: { code: "invalid_request", message: "argument command: invalid choice: 'hello'" } }, 1);
+      return reply({ ok: true, protocolVersion: 1, data: { helper: machine.helper, helperVersion: 2, capabilities: machine.capabilities ?? [], git: "/usr/bin/git", storePath: `/home/${name}/reviews.sqlite3` } });
+    }
+    assert.equal(args[0], machine.helper, `only ${name || "this computer"}'s own helper may run there`);
+    if (args.includes("--data")) {
+      const payload = JSON.parse(args.filter((_arg, index) => args[index - 1] === "--data").join(""));
+      (machine.writes ??= []).push(payload);
+      return reply({ ok: true, protocolVersion: 1, data: { reviewId: "review-a", revision: ++machine.revision } });
+    }
+    return reply({ ok: true, protocolVersion: 1, data: { context: { repoRoot: "/checkout", reviewId: "review-a", revision: machine.revision, branch: "main", storePath: `/home/${name}/reviews.sqlite3` },
+      scope: "uncommitted", snapshotId: `snap-${name}`, files: [], file: null, threads: [], drafts: [] } });
+  };
+  return { calls, execute };
+}
+
+async function remoteClient(machines, options = {}) {
   const { load } = await modules();
-  const clientModule = await load(path.join(root, "mods/Codewalker/client.js"));
-  const client = new clientModule.namespace.ReviewClient({ helper: "/helper.py", execute: async () => { calls++; } });
-  await assert.rejects(client.review({ root: "/same-local-path", on: "remote-host" }), /local checkouts only/);
-  assert.equal(calls, 0);
+  const { ReviewClient } = (await load(path.join(root, "mods/Codewalker/client.js"))).namespace;
+  const fake = fakeMachines(machines);
+  return { ...fake, client: new ReviewClient({ helper: "/app/mods/Codewalker/backend.py", execute: fake.execute, ...options }) };
+}
+
+test("a remote checkout is read by that machine's own helper and store, never this computer's", async () => {
+  const { client, calls } = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 4 } }, { store: "/local/override.sqlite3" });
+  const context = { root: "/checkout", on: "vps", source: "uncommitted" };
+  const first = await client.review(context);
+  await client.review(context);
+  assert.equal(first.machine, "vps");
+  assert.equal(first.storePath, "/home/vps/reviews.sqlite3");
+  assert.ok(calls.every(call => call.on === "vps" && call.command === "python3"), "every process starts on the checkout's machine");
+  assert.deepEqual(calls.map(call => call.args[1] === "hello" ? `hello ${call.args[0]}` : call.args.slice(0, 4).join(" ")), [
+    "hello .local/share/herdr-codewalker/backend.py",
+    "/home/vps/.local/share/herdr-codewalker/backend.py --repo /checkout review",
+    "/home/vps/.local/share/herdr-codewalker/backend.py --repo /checkout review",
+  ], "one probe, then the path the remote helper reported");
+  assert.ok(!calls.some(call => call.args.includes("/app/mods/Codewalker/backend.py") || call.args.includes("--store")), "no local helper or store path crosses over");
+  assert.equal(client.helperPath(context), "/home/vps/.local/share/herdr-codewalker/backend.py");
+  assert.equal(client.helperPath({ root: "/checkout", on: "other" }), null, "an unprobed machine has no helper path to send");
+});
+
+test("a missing helper, an outdated helper and an unreachable machine are told apart; none falls back to this computer", async () => {
+  const machines = { missing: { hello: "missing", helper: "" }, old: { hello: "old", helper: "/home/old/.config/herdr-app/mods/Codewalker/backend.py" }, down: { hello: "down" } };
+  const { client, calls } = await remoteClient(machines);
+  const code = async on => (await client.review({ root: "/checkout", on }).then(() => null, error => error));
+  const missing = await code("missing");
+  assert.equal(missing.code, "remote_helper_missing");
+  assert.equal(missing.details.install, "hc file write --on 'missing' .local/share/herdr-codewalker/backend.py < '/app/mods/Codewalker/backend.py'");
+  assert.match(missing.message, /does not copy code/);
+  assert.equal((await code("old")).code, "remote_helper_outdated");
+  assert.equal((await code("down")).code, "remote_unavailable");
+  assert.equal((await code("never-added")).code, "remote_unavailable");
+  assert.ok(calls.length && calls.every(call => call.on && call.args[1] === "hello"), "only probes ran, each on its own machine");
+  // Installing the helper needs no restart: a failed probe is asked again.
+  Object.assign(machines.missing, { hello: null, helper: "/home/missing/.local/share/herdr-codewalker/backend.py", revision: 0 });
+  assert.equal((await client.review({ root: "/checkout", on: "missing" })).machine, "missing");
+});
+
+test("the same path and branch on two machines keep separate revisions, commands and saved posts", async () => {
+  const machines = { "": { helper: "/app/mods/Codewalker/backend.py", revision: 2 }, vps: { helper: "/home/vps/backend.py", revision: 40 } };
+  machines.vps.helper = "/home/vps/.local/share/herdr-codewalker/backend.py";
+  const { client } = await remoteClient(machines);
+  const local = { root: "/checkout", on: null, source: "uncommitted" }, remote = { ...local, on: "vps" };
+  for (const context of [local, remote]) Object.assign(context, { reviewId: (await client.review(context)).reviewId });
+  assert.equal(local.reviewId, remote.reviewId, "the fixture models the real collision: one review ID on both machines");
+  const intent = { id: "draft-a", path: "a.txt", snapshotId: "snap", anchor: { side: "new", startLine: 1, endLine: 1 } };
+  await client.saveDraft(local, intent, "local text");
+  assert.equal(machines[""].writes[0].expectedRevision, 2, "the remote review's newer revision is not borrowed");
+  assert.equal(machines.vps.writes, undefined);
+  await client.setFileViewed(remote, "a.txt", "diff-a", true, "same-command-id");
+  await client.setFileViewed(local, "a.txt", "diff-a", true, "same-command-id");
+  assert.equal(machines.vps.writes[0].expectedRevision, 40);
+  assert.equal(machines[""].writes[1].expectedRevision, 3, "one command ID on two machines is two commands");
+  // A post saved for the remote checkout cannot be replayed into the local store.
+  const receipt = { commandId: "post-a", context: remote, operation: "create", payload: { commandId: "post-a", reviewId: remote.reviewId, body: "Remote question" } };
+  await assert.rejects(client.submit(local, { ...intent, pendingPost: receipt }, "Remote question", "post-a"), error => error.code === "review_conflict");
+  assert.equal(machines[""].writes.length, 2);
+  await client.submit(remote, { ...intent, pendingPost: receipt }, "Remote question", "post-a");
+  assert.deepEqual(machines.vps.writes.at(-1), receipt.payload, "the exact saved envelope goes to its own machine");
+});
+
+test("large mutation JSON is split only for a helper that says it joins --data parts", async () => {
+  const body = "α😀".repeat(20_000);
+  const send = async machine => {
+    const { client, calls } = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 1, ...machine } });
+    const context = { root: "/checkout", on: "vps", source: "uncommitted", reviewId: "review-a", revision: 1 };
+    await client.saveDraft(context, { id: "draft-a", path: "a.txt" }, body);
+    await client.saveDraft(context, { id: "draft-b", path: "a.txt" }, "short");
+    return calls.filter(call => call.args.includes("--data")).map(call => call.args.filter((_arg, index) => call.args[index - 1] === "--data"));
+  };
+  const [large, small] = await send({ capabilities: ["data-parts"] });
+  assert.ok(large.length > 1 && large.every(part => part.length <= 30_000 && part.isWellFormed()), "bounded entries, no split surrogate pair");
+  assert.equal(JSON.parse(large.join("")).body, body);
+  assert.equal(small.length, 1, "an ordinary payload keeps the single --data entry");
+  const [whole] = await send({ capabilities: [] });
+  assert.equal(whole.length, 1, "a helper without the capability gets one entry, as before");
+  assert.equal(JSON.parse(whole[0]).body, body);
+});
+
+test("the view keeps machines apart: late answers, a typed folder, and a pane beside a remote terminal", async () => {
+  const state = { active: "a", cwd: "/projects/x" }, reads = [], calls = [];
+  let current = {};
+  const { view, cx, drain, load } = await modules({
+    props: () => current,
+    spaces: () => [{ id: "space-a", active: state.active === "a", folder: "/projects/x", machine: null }, { id: "space-b", active: state.active === "b", folder: "/projects/x", machine: "vps" }],
+    panes: () => [{ pane: state.active === "b" ? "vps/p1" : "p1", tab: "t1", focused: true, cwd: state.cwd }],
+    focused: () => ({ pane: state.active === "b" ? "vps/p1" : "p1", terminal: "t1", cwd: state.cwd }),
+    run: (name, args) => calls.push([name, args]),
+    client: { review: async context => { reads.push(`${context.on ?? "local"} ${context.root}`); return { ...review(), root: context.root, machine: context.on ?? null }; } } });
+  view.intent = null;
+  view.root = "/projects/x";
+  view.on = null;
+  // The same path in a remote space is another checkout: the review is read again, there.
+  state.active = "b";
+  view.follow(cx);
+  await drain();
+  assert.equal(view.on, "vps");
+  assert.equal(reads.at(-1), "vps /projects/x");
+  // A write to this computer's review that answers late has the same review ID. It must not count here.
+  view.revision = 3;
+  view.wrote({ reviewId: view.reviewId, revision: 50, machine: null });
+  assert.equal(view.revision, 3);
+  view.wrote({ reviewId: view.reviewId, revision: 4, machine: "vps" });
+  assert.equal(view.revision, 4);
+  // A typed path stays on the machine in view; it is never silently read on this computer.
+  view.rootInput.set_value("/srv/other");
+  view.changeRoot(cx);
+  await drain();
+  assert.equal(reads.at(-1), "vps /srv/other");
+  // The key beside a remote terminal pins that machine in the new pane's stored props.
+  const main = await load(path.join(root, "mods/Codewalker/main.js"));
+  const open = async (props, active) => { state.active = active; current = props; const next = new main.namespace.default(); next.init({}, cx); if (!props.launch) cx.tasks.pop(); await drain(); return next; };
+  await open({ launch: true, overlay: "o1" }, "b");
+  assert.equal(JSON.stringify(calls.at(-1)), JSON.stringify(["pane.split", { direction: "right", pane: "vps/p1", mod: "Codewalker", props: { framed: true, folder: "/projects/x", on: "vps" } }]));
+  assert.equal((await open({ framed: true, folder: "/projects/x", on: "vps" }, "a")).on, "vps", "the stored machine wins over the active space");
+  assert.equal((await open({ framed: true, folder: "/projects/x" }, "b")).on, null, "a pinned folder without a machine is this computer, whatever space is active");
+});
+
+test("Send reaches only an agent on the checkout's machine and names that machine's helper", async () => {
+  const calls = { hc: [], deliver: [] };
+  const { view, cx, drain } = await modules({
+    agents: () => [agent("t7", { focused: true }), agent("vps/t7"), agent("vps/t9", { space: "space-b" })],
+    panes: () => [{ pane: "p-t7", cwd: "/checkout" }, { pane: "p-vps/t7", cwd: "/checkout" }],
+    focused: () => ({ space: "space-a", tab: "tab-a", pane: null, terminal: null, cwd: null }),
+    exec: async (command, args) => { assert.equal(command, "hc"); calls.hc.push(args); return { code: 0, stdout: "{}", stderr: "" }; },
+    client: { helperPath: context => context.on === "vps" ? "/home/vps/.local/share/herdr-codewalker/backend.py" : null,
+      deliver: async (context, _ids, state, target) => { calls.deliver.push([context.on, state, target]); return { reviewId: "review-a", revision: 9, machine: context.on }; } } });
+  view.intent = null;
+  view.on = "vps";
+  view.threads = [unsentThread()];
+  assert.deepEqual(view.candidates().map(a => a.address), ["vps/t7"], "the focused local agent at the same path is not offered");
+  view.sendTarget = "t7";
+  assert.equal(view.target().address, "vps/t7");
+  view.send(cx);
+  await drain();
+  assert.deepEqual(calls.deliver, [["vps", "uncertain", "vps/t7"], ["vps", "sent", "vps/t7"]]);
+  assert.equal(calls.hc[0][2], "vps/t7");
+  assert.match(calls.hc[0][3], /python3 '\/home\/vps\/\.local\/share\/herdr-codewalker\/backend\.py' skill --repo '\/checkout'/);
+  // Before that machine's helper has answered there is no path to give an agent: nothing is sent.
+  view.on = "other";
+  view.threads = [unsentThread()];
+  view.send(cx);
+  await drain();
+  assert.equal(calls.hc.length, 1);
+});
+
+test("a restored draft and its saved post stay on the machine whose store returned them", async () => {
+  const posts = [];
+  const { view, cx, drain } = await modules({ client: { submit: async (context, intent, _body, commandId) => { posts.push([context.on, intent.pendingPost.context.on, commandId]); return { thread: { id: "t1" }, machine: context.on }; } } });
+  view.intent = null;
+  view.composer.set_value("");
+  view.on = "vps";
+  // Saved by a Herdr on that machine itself, which calls it "this computer".
+  const saved = { root: "/checkout", on: null, reviewId: "review-a" };
+  view.restoreDraft({ id: "draft-r", path: "a.txt", body: "Question", intent: { id: "draft-r", path: "a.txt", context: saved,
+    pendingPost: { commandId: "post-r", context: saved, operation: "create", payload: { commandId: "post-r", reviewId: "review-a", body: "Question" } } } }, cx);
+  await drain();
+  assert.equal(view.intent.context.on, "vps");
+  view.submit(cx);
+  await drain();
+  assert.deepEqual(posts, [["vps", "vps", "post-r"]], "the same command is retried in the store it came from, not on this computer");
+});
+
+test("without a remote folder watch, an agent's turn on that machine refreshes Review", async () => {
+  let list = [agent("vps/t7", { status: "working" }), agent("t1", { status: "working" })];
+  const { view, cx, drain } = await modules({ agents: () => list });
+  const refreshes = () => Boolean(view.soonTimer);
+  view.on = "vps";
+  view.watchAgents(cx);
+  list = [list[0], agent("t1", { status: "idle" })];
+  view.watchAgents(cx);
+  await drain();
+  assert.equal(refreshes(), false, "an agent on this computer says nothing about the remote store");
+  list = [agent("vps/t7", { status: "done" }), list[1]];
+  view.watchAgents(cx);
+  await drain();
+  assert.equal(refreshes(), true);
 });
 
 test("manual checkout preserves a trailing space instead of selecting a neighboring root", async () => {
@@ -584,19 +785,26 @@ test("Delete asks first; deleting the comment removes its thread and keeps a rep
 const you = { kind: "human", id: "local", name: "You" };
 const unsentThread = (extra = {}) => ({ id: "t1", path: "a.txt", status: "open", awaitingReply: true, anchor: { side: "new", startLine: 2, endLine: 2, snippet: "TWO" }, messages: [{ id: "m1", actor: you, body: "Why upper case?" }], ...extra });
 const agent = (address, extra = {}) => ({ address, pane: `p-${address}`, space: "space-a", tab: "tab-a", tab_name: "1", status: "idle", program: { name: "Agent" }, seq: 1, focused: false, ...extra });
+// hcResult: what `hc send` answers (an Error: exec rejects; a function: awaited per call).
 async function sendSetup({ hcResult, agentsList, deliverFail } = {}) {
-  const calls = { deliver: [], hc: [], run: [] };
+  const calls = { deliver: [], hc: [], run: [], notify: [], options: [] };
   const harness = await modules({
     agents: () => agentsList ?? [agent("t7")],
     panes: () => (agentsList ?? [agent("t7")]).map(a => ({ pane: a.pane, cwd: "/checkout" })),
     focused: () => ({ space: "space-a", tab: "tab-a", pane: null, terminal: null, cwd: null }),
-    hc: async args => { calls.hc.push(args); if (hcResult instanceof Error) throw hcResult; return hcResult ?? { code: 0, stdout: "{}", stderr: "" }; },
+    exec: async (command, args, options) => {
+      assert.equal(command, "hc", "Send runs hc through exec, the only call with a time limit");
+      calls.hc.push(args); calls.options.push(options);
+      const answer = typeof hcResult === "function" ? await hcResult() : hcResult;
+      if (answer instanceof Error) throw answer;
+      return answer ?? { code: 0, stdout: JSON.stringify({ started: true, status: "idle", turn: 4 }), stderr: "" };
+    },
     run: (command, args) => calls.run.push([command, args]),
+    notify: note => calls.notify.push(note),
     client: { deliver: async (_context, ids, state, target) => { calls.deliver.push([state, ids.join(","), target]); if (deliverFail) throw new Error(deliverFail); return { reviewId: "review-a", revision: 9 }; } },
   });
   harness.view.intent = null;
   harness.view.threads = [unsentThread()];
-  harness.view.client.helper = "/app/mods/Codewalker/backend.py";
   return { ...harness, calls };
 }
 
@@ -613,7 +821,7 @@ test("the send target is the focused agent, else the only one in this checkout; 
   assert.equal(two.view.target().address, "t2");
 });
 
-test("a send records uncertain, pastes only when idle, then records sent and focuses the agent", async () => {
+test("a send records uncertain, runs plain hc send, then records sent and focuses the agent", async () => {
   const { view, cx, drain, calls } = await sendSetup();
   view.openSend(cx);
   view.send(cx);
@@ -621,12 +829,19 @@ test("a send records uncertain, pastes only when idle, then records sent and foc
   assert.deepEqual(calls.deliver.map(call => call[0]), ["uncertain", "sent"]);
   assert.deepEqual(calls.deliver[0].slice(1), ["m1", "t7"]);
   const [args] = calls.hc;
-  assert.equal(JSON.stringify(args.slice(0, 5)), JSON.stringify(["send", "--json", "--if", "idle", "t7"]));
-  assert.match(args[5], /thread t1 · short reply requested/);
-  assert.match(args[5], /Why upper case\?/);
-  assert.ok(!args.includes("--force"));
+  // Plain send: herdr-core still refuses a blocked agent and waits for a draft; never --force.
+  assert.equal(JSON.stringify(args.slice(0, 3)), JSON.stringify(["send", "--json", "t7"]));
+  assert.equal(args.length, 4);
+  // hc send waits while a person types there (60 s or more): hc()'s fixed 30 s would cut it off.
+  assert.equal(calls.options[0].timeout, 600000);
+  assert.match(args[3], /thread t1 · short reply requested/);
+  assert.match(args[3], /Why upper case\?/);
+  assert.ok(!args.includes("--force") && !args.includes("--if"));
   assert.equal(JSON.stringify(calls.run), JSON.stringify([["pane.focus", { terminal: "t7" }]]));
   assert.equal(view.mode, "files");
+  assert.equal(view.sendNotice, null);
+  assert.equal(calls.notify[0].title, "Delivered to agent");
+  assert.match(calls.notify[0].body, /1 discussion to Agent \(t7\)/);
 });
 
 test("a refused send clears the record; an unclear one keeps it uncertain; a busy agent gets nothing", async () => {
@@ -634,12 +849,14 @@ test("a refused send clears the record; an unclear one keeps it uncertain; a bus
   refused.view.send(refused.cx);
   await refused.drain();
   assert.deepEqual(refused.calls.deliver.map(call => call[0]), ["uncertain", "none"]);
-  assert.match(refused.view.sendNotice.error, /Not sent: t7 is working/);
+  assert.equal(refused.view.sendNotice.state, "refused");
+  assert.match(refused.view.sendNotice.error, /^Not sent to Agent \(t7\): t7 is working\. Nothing was typed\./);
   const unclear = await sendSetup({ hcResult: { code: 1, stdout: "", stderr: "" } });
   unclear.view.send(unclear.cx);
   await unclear.drain();
   assert.deepEqual(unclear.calls.deliver.map(call => call[0]), ["uncertain"]);
-  assert.match(unclear.view.sendNotice.error, /unclear/);
+  assert.equal(unclear.view.sendNotice.state, "unconfirmed");
+  assert.match(unclear.view.sendNotice.error, /^No confirmation from Agent \(t7\): hc exited 1\. It may have arrived\./);
   const busy = await sendSetup({ agentsList: [agent("t7", { status: "working" })] });
   busy.view.send(busy.cx);
   await busy.drain();
@@ -650,15 +867,101 @@ test("a refused send clears the record; an unclear one keeps it uncertain; a bus
   assert.equal(noRecord.calls.hc.length, 0, "nothing is typed unless the uncertain record is durable");
 });
 
+test("only a send hc refused before typing clears the record; a lost answer stays unconfirmed and is not sent again", async () => {
+  const failure = (code, kind, message, hint) => ({ code, stdout: "", stderr: JSON.stringify({ error: { kind, message, hint } }) });
+  const cases = [
+    [new Error("hc took longer than 600 s and was stopped"), "unconfirmed", /^No confirmation from Agent \(t7\): no answer after 10 minutes\. It may have arrived\. Check that chat before you send again\.$/],
+    [failure(5, "unavailable", "studio didn't answer within 95 s", "it may still have been typed; check with hc read before retrying"), "unconfirmed", /studio didn't answer within 95 s\. It may have arrived/],
+    [failure(5, "unavailable", "t7 is still starting: its output has not settled", "nothing was typed; check hc read t7, then retry"), "refused", /^Not sent to Agent \(t7\): t7 is still starting.*Nothing was typed\.$/],
+    // A cancel prints no kind, and a signal can end hc with 130 too: not proof.
+    [{ code: 130, stdout: "", stderr: "" }, "unconfirmed", /hc exited 130\. It may have arrived/],
+    // A refusal code alone, without the kind herdr-core prints for it, is not proof either.
+    [{ code: 10, stdout: "", stderr: "Killed" }, "unconfirmed", /hc exited 10\. It may have arrived/],
+    [new Error("cannot run hc: No such file or directory (os error 2)"), "refused", /cannot run hc/],
+  ];
+  for (const [hcResult, state, text] of cases) {
+    const { view, cx, drain, calls } = await sendSetup({ hcResult });
+    view.openSend(cx);
+    view.send(cx);
+    await drain();
+    assert.deepEqual(calls.deliver.map(call => call[0]), state === "refused" ? ["uncertain", "none"] : ["uncertain"], text.source);
+    assert.equal(view.sendNotice.state, state);
+    assert.match(view.sendNotice.error, text);
+    assert.equal(calls.hc.length, 1, "never retried on its own");
+    assert.equal(calls.notify.length + calls.run.length, 0, "no success toast or focus");
+    assert.equal(view.mode, "send");
+  }
+});
+
+test("an idle or done agent gets a plain send; hc's refusal of a blocked one types nothing and clears the record", async () => {
+  // The app's "idle" includes a seen finished turn (core word "done"), and --if has no idle-or-done.
+  for (const status of ["idle", "done"]) {
+    const { view, cx, drain, calls } = await sendSetup({ agentsList: [agent("studio/t16d", { status })] });
+    view.on = "studio";
+    view.client.helperPath = () => "/home/studio/backend.py";
+    view.send(cx);
+    await drain();
+    assert.equal(JSON.stringify(calls.hc[0].slice(0, 3)), JSON.stringify(["send", "--json", "studio/t16d"]), status);
+    assert.ok(!calls.hc[0].includes("--if") && !calls.hc[0].includes("--force"));
+    assert.deepEqual(calls.deliver.map(call => call[0] + " " + call[2]), ["uncertain studio/t16d", "sent studio/t16d"]);
+  }
+  // It turned blocked after the click: herdr-core refuses at typing time.
+  const blocked = { code: 9, stdout: "", stderr: JSON.stringify({ error: { kind: "blocked", message: "t16d is blocked (permission)", hint: "typing would answer its dialog; read its screen first (hc read t16d), or --force" } }) };
+  const { view, cx, drain, calls } = await sendSetup({ agentsList: [agent("studio/t16d", { status: "done" })], hcResult: blocked });
+  view.on = "studio";
+  view.client.helperPath = () => "/home/studio/backend.py";
+  view.send(cx);
+  await drain();
+  assert.deepEqual(calls.deliver.map(call => call[0]), ["uncertain", "none"]);
+  assert.equal(view.sendNotice.error, "Not sent to Agent (studio/t16d): t16d is blocked (permission). Nothing was typed.");
+});
+
+test("a send shows Sending while hc waits, and an answer after the checkout changed only notifies", async () => {
+  const answers = [deferred(), deferred()];
+  let call = 0;
+  const { view, cx, drain, calls } = await sendSetup({ hcResult: () => answers[call++].promise });
+  view.sendNote.set_value("Fix first");
+  view.openSend(cx);
+  view.send(cx);
+  await settle();
+  assert.equal(view.sending, true);
+  assert.deepEqual({ ...view.sendNotice }, { state: "sending", target: "t7", name: "Agent" });
+  view.openSend(cx);
+  assert.equal(view.sendNotice?.state, "sending", "reopening Send keeps showing the send in progress");
+  view.send(cx);
+  assert.equal(calls.hc.length, 1, "no second send while one waits");
+  view.resetContext();
+  answers[0].resolve({ code: 0, stdout: "{}", stderr: "" });
+  await drain();
+  assert.deepEqual(calls.deliver.map(call => call[0]), ["uncertain", "sent"], "the outcome is recorded in the checkout it was sent from");
+  assert.equal(calls.notify[0].title, "Delivered to agent");
+  assert.equal(calls.run.length, 0, "no focus jump after the person moved on");
+  assert.equal(view.mode, "send");
+  assert.equal(view.sendNote.value(), "Fix first");
+  assert.equal(view.sendNotice, null);
+  assert.equal(view.sending, false);
+  Object.assign(view, { root: "/checkout", reviewId: "review-a", threads: [unsentThread()] }); // The next checkout loaded.
+  view.send(cx);
+  await settle();
+  assert.equal(calls.hc.length, 2);
+  view.resetContext();
+  answers[1].reject(new Error("hc took longer than 600 s and was stopped"));
+  await drain();
+  assert.equal(calls.notify[1].title, "Confirmation missing");
+  assert.match(calls.notify[1].body, /^No confirmation from Agent \(t7\)/);
+  assert.equal(view.sendNotice, null, "the other checkout's view shows no stale notice");
+});
+
 test("only new comments in open threads are sent, also where the code changed; an unclear send goes again only on request", async () => {
   const { load } = await modules();
   const model = (await load(path.join(root, "mods/Codewalker/model.js"))).namespace;
-  const sent = { id: "m0", actor: you, body: "Old", delivery: { state: "sent" } }, unsure = { id: "m2", actor: you, body: "Maybe", delivery: { state: "uncertain" } };
+  const sent = { id: "m0", actor: you, body: "Old", delivery: { state: "sent", target: "t1" } }, unsure = { id: "m2", actor: you, body: "Maybe", delivery: { state: "uncertain", target: "studio/t16d" } };
   const threads = [unsentThread(), unsentThread({ id: "t2", status: "resolved" }), unsentThread({ id: "t3", outdated: true }),
     unsentThread({ id: "t4", messages: [sent] }), unsentThread({ id: "t5", awaitingReply: false, messages: [unsure] })];
   assert.equal(JSON.stringify(model.sendable(threads).map(item => item.thread.id)), JSON.stringify(["t1", "t3"]));
   assert.equal(JSON.stringify(model.sendable(threads, { again: true }).map(item => item.thread.id)), JSON.stringify(["t1", "t3", "t5"]));
   assert.equal(model.uncertainCount(threads), 1);
+  assert.equal(model.unconfirmedTargets(threads), "studio/t16d", "the banner names where the unconfirmed send went");
   const text = model.sendText({ items: model.sendable([threads[4]], { again: true }), root: "/my checkout", branch: "main", helper: "/app/it's/backend.py", note: " Fix first " });
   assert.ok(!text.includes("short reply requested"), "no reply instruction unless asked");
   assert.match(text, /\nFix first\n/);

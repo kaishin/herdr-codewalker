@@ -540,6 +540,83 @@ console.log(JSON.stringify({ threadId: final.threads[0].id, messages: final.thre
         self.assertEqual(len(final["threads"]), 1)
         self.assertEqual(final["threads"][0]["messages"][0]["body"], body)
 
+    def test_native_adapter_keeps_a_remote_machines_review_in_that_machines_store(self):
+        # A second machine is modeled by its own home folder. Only the Herdr process bridge is
+        # replaced: `on` selects that home. Git, both helpers, both stores and the adapter are real.
+        vps = self.base / "vps-home"
+        installed = vps / ".local/share/herdr-codewalker/backend.py"
+        installed.parent.mkdir(parents=True)
+        shutil.copyfile(HELPER.parent.parent / "mods/Codewalker/backend.py", installed)
+        script = r"""
+import vm from "node:vm";
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+const config = JSON.parse(process.argv[1]);
+const scope = vm.createContext({ console });
+const modules = new Map();
+const host = new vm.SyntheticModule(["exec"], function () {
+  this.setExport("exec", () => { throw new Error("Unexpected real Herdr invocation"); });
+}, { context: scope });
+async function load(filename) {
+  if (modules.has(filename)) return modules.get(filename);
+  const module = new vm.SourceTextModule(fs.readFileSync(filename, "utf8"), { context: scope, identifier: filename });
+  modules.set(filename, module);
+  await module.link(specifier => specifier === "herdr" ? host : load(path.resolve(path.dirname(filename), specifier)));
+  return module;
+}
+const module = await load(config.client);
+await module.evaluate();
+const parts = [];
+async function execute(command, args, options) {
+  if (options?.on && options.on !== "vps") throw new Error(`unknown machine ${options.on}`);
+  // Like exec on another machine: that user's home is the folder and the environment.
+  const env = { ...process.env };
+  if (options?.on) { env.HOME = config.vpsHome; delete env.XDG_DATA_HOME; }
+  parts.push(args.filter(arg => arg === "--data").length);
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: 15000, env, cwd: options?.on ? config.vpsHome : undefined });
+  if (result.error) throw result.error;
+  return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+const client = new module.namespace.ReviewClient({ helper: config.helper, execute, store: config.store });
+const open = async on => {
+  const context = { root: config.root, source: "uncommitted", on };
+  const review = await client.file(context, "src/example.txt");
+  return Object.assign(context, { reviewId: review.reviewId, revision: review.revision, snapshotId: review.snapshotId });
+};
+const intent = id => ({ id, path: "src/example.txt", anchor: { side: "new", startLine: 2, endLine: 2 } });
+const remote = await open("vps"), local = await open(null);
+assert.equal(remote.reviewId, local.reviewId, "same path and branch: one review ID on both machines");
+await client.submit(remote, { ...intent("remote-draft"), snapshotId: remote.snapshotId, context: remote }, config.body, "post-remote");
+await client.submit(local, { ...intent("local-draft"), snapshotId: local.snapshotId, context: local }, "Local question", "post-local");
+const stored = (await client.review(remote)).storePath;
+console.log(JSON.stringify({ helper: client.helperPath(remote), stored, maxParts: Math.max(...parts),
+  remote: (await client.review(remote)).threads.map(thread => thread.messages[0].body),
+  local: (await client.review(local)).threads.map(thread => thread.messages[0].body) }));
+"""
+        # The saved-post draft carries the body twice: well above one 30,000-unit --data entry.
+        body = "Remote reasoning α😀\n" * 2400
+        result = subprocess.run(
+            ["node", "--experimental-vm-modules", "--input-type=module", "-e", script,
+             json.dumps({"client": str(HELPER.parent.parent / "mods/Codewalker/client.js"), "vpsHome": str(vps),
+                         "helper": str(HELPER), "root": str(self.repo), "store": str(self.store), "body": body})],
+            cwd=self.base, env=self.env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        seen = json.loads(result.stdout)
+        self.assertEqual(seen["helper"], str(installed), "agents on that machine get its own helper path")
+        self.assertTrue(seen["stored"].startswith(str(vps) + os.sep), seen["stored"])
+        self.assertGreater(seen["maxParts"], 1, "the large payload really travelled as joined --data entries")
+        self.assertEqual(seen["remote"], [body])
+        self.assertEqual(seen["local"], ["Local question"])
+        # Independent of the adapter: each store holds only its own machine's discussion.
+        self.assertEqual([t["messages"][0]["body"] for t in self.call("list")["threads"]], ["Local question"])
+        remote = subprocess.run([sys.executable, str(installed), "--repo", str(self.repo), "list", "--json"],
+                                env={k: v for k, v in {**self.env, "HOME": str(vps)}.items() if k != "XDG_DATA_HOME"},
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual([t["messages"][0]["body"] for t in json.loads(remote.stdout)["data"]["threads"]], [body])
+
     def test_drafts_are_durable_actor_owned_and_corrupt_store_is_not_reset(self):
         context = self.call("context")
         draft = self.call("draft-save", data=self.mutation(
