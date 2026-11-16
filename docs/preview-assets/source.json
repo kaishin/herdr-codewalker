@@ -3,8 +3,8 @@
   "fixture": "docs/preview-assets/fixture.js",
   "fixtureSha256": "3de176e581d95f38d7d23abd291905d9a08e74031cae7031509931e09d9b10ae",
   "view": "mods/Codewalker/main.js",
-  "viewSha256": "1da307bd7d8669b2749755ca2f52d6e5a4c25d3d2d3d6b6b7cee2f6d2a0c68da",
-  "viewCommit": "ccec7ec4c9b95513a5990f27407a4df1b04b0d53",
+  "viewSha256": "76e614afc1e0f01ea5ab1f8986cc8ddc5364f5f82e15466232f33ebc37c52474",
+  "viewCommit": "1cd74149f5625088828b382de10b05dc8367e228",
   "content": "Synthetic local commit diff and inline discussion; no user repository or agent data.",
   "sourceCrop": "docs/preview-assets/review.png",
   "cropPixels": {
@@ -17,7 +17,7 @@
     3840,
     2098
   ],
-  "sourceCropSha256": "c263ab6f155017e71540836f9966283fc14d37beeba3238b7b5a6ee54166530e",
+  "sourceCropSha256": "af7fb13e721611f3012e044854eb674832b8a715a5ca08412a4fc51192ad68cd",
   "composition": "scripts/preview.py --compose",
   "output": "preview.png",
   "outputPixels": [
@@ -27,5 +27,7 @@
   "font": "Inter 4.1, SIL OFL 1.1; see INTER-LICENSE.txt",
   "reference": "https://assets.herdr.dev/previews/45ece07a1644bc44c46f8a6d9269856584737a8ea22195ad105da502ab29fa31.png",
   "privacy": "Full-window capture is deliberately not distributed. Only the inspected interior crop is kept.",
-  "background": "Blue/purple tinted paper with a 24-logical-pixel notebook dot grid"
+  "background": "Blue/purple tinted paper with a 24-logical-pixel notebook dot grid",
+  "viewState": "Uncommitted diff typography refinement following Herdr code font settings; viewSha256 identifies the captured source.",
+  "codeFontSize": 10
 }

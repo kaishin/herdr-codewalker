@@ -21,7 +21,7 @@ const REVIEW_DOCK = { panel: "panel", stack: "panel-body", child: "review" };
 const panelExpander = dockExpand({ layout, run, shared, setShared });
 // Icons are Lucide (ISC), written by scripts/lucide_icons.py; see icons/LICENSE.
 // Diff columns: old and new line numbers, the hover comment button, the +/− sign.
-const MARK_W = 22, SIGN_W = 16, ROW_H = 22;
+const MARK_W = 22, SIGN_W = 16;
 // Docked beside the agent, Review stacks files above the diff. Wider, they sit side by side.
 const SPLIT_W = 760, COMPACT_W = 560;
 
@@ -1350,20 +1350,22 @@ export default class Codewalker extends View {
   }
 
   diffRow(row, index, marked, live) {
-    const t = theme(), mono = settings().font_family, minus = row.kind === "-", plus = row.kind === "+";
-    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(26).px(12).items_center().bg(t.raised).border_y(1).border_color(t.border)
-      .font_family(mono).text_size(11).text_color(t.dim).child(div().truncate().child(row.text));
+    const t = theme(), look = settings(), mono = look.font_family, fontSize = look.font_size ?? 12;
+    // Follow Herdr's live code size; leave room for the 16px hover button and larger fonts.
+    const rowH = Math.max(18, Math.ceil(fontSize * 1.5)), minus = row.kind === "-", plus = row.kind === "+";
+    if (row.kind === "@") return h_flex().id(`hunk-${index}`).h(Math.max(26, rowH)).px(12).items_center().bg(t.raised).border_y(1).border_color(t.border)
+      .font_family(mono).text_size(fontSize).text_color(t.dim).child(div().truncate().child(row.text));
     const tone = plus ? t.ansi2 : minus ? t.ansi1 : null, hovered = live && !this.drag && this.hoverRow === index;
-    const number = (side, line) => div().id(`line-${index}-${side}`).w(this.cols.num).h(ROW_H).flex_none().flex().items_center().justify_end().pr(this.cols.num > 40 ? 8 : 5)
-      .text_size(11).text_color(marked ? t.foreground : t.dim)
+    const number = (side, line) => div().id(`line-${index}-${side}`).w(this.cols.num).h(rowH).flex_none().flex().items_center().justify_end().pr(this.cols.num > 40 ? 8 : 5)
+      .text_size(fontSize).text_color(marked ? t.foreground : t.dim)
       .when(live, el => el.cursor_pointer().hover(s => s.text_color(t.foreground)))
       .on_mouse_down("left", (event, cx) => { cx.stop_propagation(); if (live) this.pressLine(index, side, event, cx); })
       .child(line ? String(line) : "");
-    const comment = div().id(`comment-${index}`).w(MARK_W).h(ROW_H).flex_none().flex().items_center().justify_center()
+    const comment = div().id(`comment-${index}`).w(MARK_W).h(rowH).flex_none().flex().items_center().justify_center()
       .on_mouse_down("left", (event, cx) => { cx.stop_propagation(); if (live) this.pressLine(index, lineOf(row, "new") ? "new" : "old", event, cx); })
       .when(hovered, el => el.cursor_pointer().child(div().size(16).rounded(4).flex().items_center().justify_center().bg(t.accent)
         .child(svg(ICON.plus).size(11).text_color(t.accent_foreground))));
-    return h_flex().id(`row-${index}`).min_h(ROW_H).items_stretch().font_family(mono).text_size(12)
+    return h_flex().id(`row-${index}`).min_h(rowH).items_stretch().font_family(mono).text_size(fontSize).line_height(`${rowH}px`)
       .bg(marked ? tint(t.accent, 0x24) : tone ? tint(tone, 0x14) : t.background)
       .when(live && !marked, el => el.hover(s => s.bg(tone ? tint(tone, 0x26) : t.hover)))
       .when(live, el => el.on_hover((inside, cx) => this.hoverLine(index, inside, cx)))
