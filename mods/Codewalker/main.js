@@ -1157,7 +1157,7 @@ export default class Codewalker extends View {
       .when(!edit, el => el.child(TextView.markdown(`${prefix}-body-${message.id}`, markdownBody(message.body)).selectable(true).w_full().text_size(12).text_color(t.foreground)
         .on_link_click((url, cx) => { if (/^https?:\/\//i.test(url)) cx.open_url(url); })))
       .when(confirming && !edit, el => el.child(h_flex().gap(8).pt(4).items_center()
-        .child(div().flex_1().min_w(0).text_size(11).text_color(t.ansi1).child(first ? "Delete this comment and its whole thread, replies included?" : "Delete this reply?"))
+        .child(div().flex_1().min_w(0).text_size(11).text_color(t.ansi1).child(first ? "Delete this comment and thread?" : "Delete this reply?"))
         .child(this.button(`${prefix}-keep-${message.id}`, "Keep", cx => { this.confirmDelete = null; cx.notify(); }, { small: true, ghost: true, enabled: !this.saving }))
         .child(this.button(`${prefix}-confirm-delete-${message.id}`, this.saving ? "Deleting…" : first ? "Delete thread" : "Delete", cx => this.deleteMessage(message, cx), { small: true, danger: true, icon: ICON.trash, enabled: !this.saving }))))
       .when(Boolean(edit), el => el
