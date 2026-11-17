@@ -22,6 +22,7 @@ export default class Fixture extends Codewalker {
     this.rows = [{kind:"@",text:"@@ -1,2 +1,2 @@"},{kind:"-",oldLine:1,newLine:null,text:"old_value = 1"},{kind:"+",oldLine:null,newLine:1,text:"new_value = 2"},{kind:" ",oldLine:2,newLine:2,text:"print(value)"}];
     const anchor = {side:"new",startLine:1,endLine:1,snippet:"new_value = 2"};
     this.threads = [{id:"synthetic-thread",path:this.file,anchor,status:"open",messages:[{id:"synthetic-human",actor:{kind:"human",id:"local",name:"You"},body:"Synthetic fixture: why change this value?",createdAt:"2026-01-01T10:00:00Z"},{id:"synthetic-agent",actor:{kind:"agent",id:"example",name:"Example agent"},body:"Synthetic fixture: it corrects the boundary condition.",createdAt:"2026-01-01T10:01:00Z"}]},{id:"synthetic-outdated",path:this.file,anchor:{...anchor,startLine:40,endLine:40,snippet:"original_code()"},outdated:true,status:"resolved",messages:[{id:"synthetic-old",actor:{kind:"human",id:"local",name:"You"},body:"Synthetic fixture: retained discussion.",createdAt:"2026-01-01T10:00:00Z"}]}];
+    this.threads.push({...this.threads[0], id:"synthetic-gone", path:"src/removed.py", messages:[{...this.threads[0].messages[0], id:"synthetic-gone-human"}]});
     this.intent = {id:"synthetic-draft",path:this.file,threadId:"synthetic-thread",anchor,snapshotId:this.snapshotId,context:this.context()};
     this.composer.set_value("Synthetic reply draft");
     this.draftStatus = "Synthetic fixture · not written to disk";
@@ -105,6 +106,9 @@ def main():
         hover = 'this.hoverRow = 2; this.intent = {...this.intent, threadId:null, anchor:{side:"new",startLine:1,endLine:2}};'
         docked = 'this.width = 368; this.height = 900; this.threads[0] = {...this.threads[0], awaitingReply:true}; this.intent = {...this.intent, replyRequested:true};'
         listing = 'this.width = 368; this.height = 900; this.mode = "discussions";'
+        history = listing + ' this.filter = "all"; this.intent = null;'
+        clearing = history + ' this.clearAttempt = {context:this.context(), commandId:"clear-fixture", revision:this.revision};'
+        uncertain = clearing + ' this.clearAttempt.uncertain = true;'
         editing = 'this.editing = {id:"synthetic-human", body:"Synthetic fixture: why change this value?", commandId:"c"}; this.editor.set_value(this.editing.body);'
         deleting = 'this.confirmDelete = "synthetic-human";'
         sending = 'this.width = 368; this.height = 900; this.mode = "send";'
@@ -118,19 +122,19 @@ def main():
         expandable = 'this.width = 368; this.expansionState = () => ({supported:true, expanded:false, mode:"fill"});'
         expanded = 'this.width = 1100; this.expansionState = () => ({supported:true, expanded:true, mode:"fill"});'
         # A resolved discussion outside the shown lines, opened; then none outside, with long labels.
-        unfolded = 'this.width = 300; this.height = 900; this.expanded.add("synthetic-outdated");'
+        unfolded = 'this.width = 300; this.height = 900; this.filter = "all"; this.expanded.add("synthetic-outdated");'
         inside = 'this.width = 300; this.height = 900; this.threads = [{...this.threads[0], awaitingReply:true}];'
         # Folded, the count is the only sign of a long thread; its messages are not rendered.
-        crowded = 'this.width = 300; this.height = 900; this.threads[1] = {...this.threads[1], awaitingReply:true, messages:Array.from({length:128}, (_, i) => ({...this.threads[1].messages[0], id:`synthetic-old-${i}`}))};'
-        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit), ("null", remote), ("null", unfolded), ("null", inside), ("null", crowded)):
+        crowded = 'this.filter = "all"; this.width = 300; this.height = 900; this.threads[1] = {...this.threads[1], awaitingReply:true, messages:Array.from({length:128}, (_, i) => ({...this.threads[1].messages[0], id:`synthetic-old-${i}`}))};'
+        for pending, extra in (("null", expandable), ("null", expanded), ("null", cached), ("null", ""), ('"src/other.py"', ""), ("null", hover), ("null", docked), ("null", listing), ("null", history), ("null", clearing), ("null", uncertain), ("null", editing), ("null", deleting), ("null", sending), ("null", viewed), ("null", hidden), ("null", branch), ("null", commit), ("null", remote), ("null", unfolded), ("null", inside), ("null", crowded)):
             (destination / "main.js").write_text(FIXTURE.replace("PENDING", pending).replace("EXTRA", extra))
             result = subprocess.run(["herdr-app", "check", str(destination), "--print-spec"],
                                     check=True, capture_output=True, text=True)
             spec = result.stdout
             narrow = extra in (expandable, docked, viewed, hidden, branch, commit, cached, remote, unfolded, inside, crowded)
-            if extra not in (listing, sending):
+            if extra not in (listing, history, clearing, uncertain, sending):
                 outside = '"Discussions outside the shown lines"' in spec
-                assert outside == (extra != inside), "Only a thread with no shown line is listed outside the shown lines"
+                assert outside == (extra in (unfolded, crowded)), "Only a thread with no shown line is listed outside the shown lines"
                 check_thread_header(spec, "synthetic-thread", True)
                 if outside:
                     check_thread_header(spec, "synthetic-outdated", extra == unfolded)
@@ -171,14 +175,24 @@ def main():
                 print(result.stderr.strip())
                 continue
             if not extra:
-                assert 'Button "open-send"' in spec, "Unsent comments offer Send in the toolbar"
+                assert 'Button "show-history"' in spec, "Hidden history has an explicit recovery path"
+                assert 'thread-synthetic-outdated' not in spec and 'Button "retained-src/removed.py"' not in spec, "The active review excludes resolved and absent-file discussions"
+                assert 'Button "open-send"'  in spec, "Unsent comments offer Send in the toolbar"
                 # Comment bodies are Markdown (TextView), not plain text.
                 assert 'message-body-synthetic-human' in spec, "Comment bodies render as Markdown"
-            if extra == listing:
-                # Every thread by file; replies sit indented under the first comment.
+            if extra in (listing, history, clearing, uncertain):
+                # Active is clean; All recovers history; clearing always asks first.
                 assert ':id[Str("review-discussions")]' in spec and ':id[Str("review-diff-' not in spec, "Discussions replace the file list and diff"
                 assert '"Show in diff"' in spec and ".border_l[Number(2.0)]" in spec, "Each thread links to its diff; replies are indented"
                 assert 'Button "group-src/example.py"' in spec, "Threads group under their file"
+                assert ('discussion-synthetic-outdated' in spec) == (extra != listing), "Resolved discussions are history, not active work"
+                assert ('Button "group-src/removed.py"' in spec) == (extra != listing), "Absent files appear only in All"
+                assert ('Button "clear-history"' in spec) == (extra == history), "Only All offers explicit clearing"
+                assert ('Button "confirm-clear-history"' in spec) == (extra in (clearing, uncertain)), "Clearing needs confirmation"
+                if extra == clearing:
+                    assert '"Delete discussions"' in spec and '"Cancel"' in spec and 'Drafts and viewed marks are kept.' in spec
+                if extra == uncertain:
+                    assert '"Retry clear"' in spec and 'not to delete newer discussions' in spec
                 assert "WARN" not in result.stderr, result.stderr
                 print(result.stderr.strip())
                 continue

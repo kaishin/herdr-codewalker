@@ -82,13 +82,20 @@ export function pageRows(rows, page, size = PAGE_ROWS, from = null) {
   return { rows: rows.slice(current * size, (current + 1) * size), page: current, pages, start: current * size };
 }
 
-// Discussions by file: files in diff order, then paths no longer in the diff;
-// threads by line. `filter`: "all", "open" or "awaiting".
-export function discussionGroups(threads, files, filter = "all") {
-  const keep = thread => filter === "open" ? thread.status !== "resolved" : filter === "awaiting" ? thread.awaitingReply === true : true;
+// A changed anchor is still actionable while its file remains in the diff.
+// Resolved and out-of-diff threads stay stored, but are history by default.
+export function activeThreads(threads, files) {
+  const changed = new Set(files.map(file => file.path));
+  return threads.filter(thread => thread.status !== "resolved" && changed.has(thread.path));
+}
+
+// Files in diff order, then historical paths; threads by line.
+export function discussionGroups(threads, files, filter = "active") {
+  const shown = filter === "all" ? threads : activeThreads(threads, files);
+  const keep = thread => filter !== "awaiting" || thread.awaitingReply === true;
   const order = new Map(files.map((file, index) => [file.path, index]));
   const groups = new Map();
-  for (const thread of threads.filter(keep)) {
+  for (const thread of shown.filter(keep)) {
     if (!groups.has(thread.path)) groups.set(thread.path, []);
     groups.get(thread.path).push(thread);
   }

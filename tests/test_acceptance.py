@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -616,6 +617,49 @@ console.log(JSON.stringify({ helper: client.helperPath(remote), stored, maxParts
                                 env={k: v for k, v in {**self.env, "HOME": str(vps)}.items() if k != "XDG_DATA_HOME"},
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual([t["messages"][0]["body"] for t in json.loads(remote.stdout)["data"]["threads"]], [body])
+
+    def test_history_clear_is_confirmed_review_scoped_and_replay_never_deletes_new_discussions(self):
+        created, _ = self.create()
+        first = created["thread"]["messages"][0]["id"]
+        self.call("edit", data=self.mutation(created["revision"], messageId=first, body="Edited rationale"))
+        state = self.call("list")
+        self.call("deliver", data=self.mutation(state["revision"], messageIds=[first], state="sent", target="fixture-agent"))
+        agent, _ = self.create(actor=AGENT, body="Agent-originated history")
+        self.call("resolve", data=self.mutation(agent["revision"], threadId=agent["thread"]["id"], resolved=True))
+        state = self.call("list")
+        self.call("draft-save", data=self.mutation(state["revision"], draftId="keep-draft", body="Keep my unsent text", target={"threadId": created["thread"]["id"]}))
+        review = self.review()
+        self.call("file-view", data=self.mutation(review["context"]["revision"], scope="uncommitted", path=PATH,
+                  diffFingerprint=review["file"]["diffFingerprint"], viewed=True))
+        self.git("checkout", "-qb", "other-review")
+        other, _ = self.create(body="Other branch survives")
+        self.git("checkout", "-q", "main")
+        before = self.call("list")
+        request = self.mutation(before["revision"], confirmed=True)
+        self.failure("history-clear", data={**request, "actor": AGENT}, codes={"invalid_request"})
+        self.failure("history-clear", data={**request, "confirmed": False}, codes={"invalid_request"})
+        self.failure("history-clear", data={**request, "confirmed": 1}, codes={"invalid_request"})
+        self.failure("history-clear", data={**request, "expectedRevision": before["revision"] - 1}, codes={"revision_conflict"})
+        self.assertEqual(len(self.call("list")["threads"]), 2)
+        source = self.source_digest()
+        cleared = self.call("history-clear", data=request)
+        self.assertEqual(cleared["cleared"], {"threads": 2})
+        after = self.call("list")
+        self.assertEqual(after["threads"], [])
+        self.assertEqual(after["drafts"], before["drafts"])
+        self.assertEqual(after["viewedFiles"], before["viewedFiles"])
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        with sqlite3.connect(self.store) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM message_edits WHERE message_id=?", (first,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM deliveries WHERE message_id=?", (first,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(self.source_digest(), source, "clearing must not change Git or source files")
+        newer, _ = self.create(body="Posted after clearing")
+        self.assertEqual(self.call("history-clear", data=request), cleared)
+        self.assertEqual(self.call("list")["threads"][0]["id"], newer["thread"]["id"])
+        self.failure("history-clear", data={**request, "expectedRevision": newer["revision"]}, codes={"idempotency_conflict"})
+        self.git("checkout", "-q", "other-review")
+        self.assertEqual(self.call("list")["threads"][0]["id"], other["thread"]["id"])
 
     def test_drafts_are_durable_actor_owned_and_corrupt_store_is_not_reset(self):
         context = self.call("context")

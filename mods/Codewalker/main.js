@@ -3,7 +3,7 @@ import { h_flex, v_flex, Button, Checkbox, InputState, Input, TextareaState, Tex
 import { props, spaces, panes, focused, agents, exec, run, notify, appHome, theme, settings, closeOverlay, nextCommand, watchFolder, layout, shared, setShared } from "herdr";
 import { ReviewClient, HUMAN, machineOf } from "./client.js";
 import { dockExpand, RESTORE_TIMEOUT } from "./dock-expand.js";
-import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody } from "./model.js";
+import { PAGE_ROWS, newId, anchorLabel, rowAnchor, lineOf, splitPath, tint, actorLabel, threadLine, threadIsOutdated, timestamp, readableError, pageRows, activeThreads, discussionGroups, sendable, uncertainCount, unconfirmedTargets, sendText, utf8Bytes, markdownBody } from "./model.js";
 
 const stop = (_event, cx) => cx.stop_propagation();
 // Recently viewed diffs for the current snapshot only; bounded by files and rows.
@@ -161,9 +161,10 @@ export default class Codewalker extends View {
     this.hoverRow = null;
     this.drag = null;
     this.page = 0;
-    // "files": changed files and a diff. "discussions": every thread, by file.
+    // History is opt-in across the file list, inline cards, and Discussions.
     this.mode = "files";
-    this.filter = "all";
+    this.filter = "active";
+    this.clearAttempt = null;
     this.hideViewed = false;
     // Show in diff: the row the diff starts at, the thread to place, the card to mark.
     this.from = null;
@@ -367,7 +368,12 @@ export default class Codewalker extends View {
     }
     if (review.detail) this.remember(review.detail);
     this.watch(cx, review.root, review.storePath);
-    const wanted = this.pendingFile ?? this.file ?? review.detail?.path ?? this.files[0]?.path ?? this.threads[0]?.path ?? null;
+    const selected = this.pendingFile ?? this.file;
+    const protectedPath = this.intent?.path === selected || this.threads.some(thread => thread.path === selected
+      && (thread.id === this.focusThread || thread.messages.some(message => message.id === this.editing?.id)));
+    const keepSelected = Boolean(this.pendingFile) || this.filter === "all" || protectedPath || this.files.some(file => file.path === selected);
+    const wanted = (keepSelected ? selected : null) ?? this.files[0]?.path
+      ?? (review.detail?.rows.length ? review.detail.path : null) ?? (this.filter === "all" ? this.threads[0]?.path : null) ?? null;
     if (!wanted) {
       this.file = this.pendingFile = this.rowsSnapshot = this.rowsFingerprint = null;
       this.rows = [];
@@ -490,6 +496,19 @@ export default class Codewalker extends View {
 
   visibleFiles() {
     return this.hideViewed ? this.files.filter(file => !file.viewed) : this.files;
+  }
+
+  visibleThreads() {
+    return this.filter === "all" ? this.threads : activeThreads(this.threads, this.files);
+  }
+
+  setDiscussionFilter(filter, cx) {
+    this.filter = filter;
+    if (filter !== "all") {
+      this.focusThread = null;
+      if (this.file && !this.files.some(file => file.path === this.file)) this.refresh(cx, true);
+    }
+    cx.notify();
   }
 
   viewedBox(file) {
@@ -630,6 +649,8 @@ export default class Codewalker extends View {
     this.focusThread = null;
     this.editing = null;
     this.confirmDelete = null;
+    this.clearAttempt = null;
+    this.filter = "active";
     this.editor.set_value("");
     this.hoverRow = null;
     this.drag = null;
@@ -994,7 +1015,7 @@ export default class Codewalker extends View {
   // The send can wait minutes: its outcome changes this view only while the
   // same checkout is shown; otherwise a notification tells it.
   send(cx) {
-    const target = this.target(), items = sendable(this.threads, { again: this.sendAgain });
+    const target = this.target(), items = sendable(this.visibleThreads(), { again: this.sendAgain });
     const context = this.context(), helper = this.client.helperPath(context);
     if (this.cachedComparison || !target || !READY.has(target.status) || !items.length || this.sending || !this.reviewId || !helper || idMachine(target.address) !== this.on) return;
     const ids = items.flatMap(item => item.messageIds), note = this.sendNote.value(), version = this.contextVersion;
@@ -1078,12 +1099,65 @@ export default class Codewalker extends View {
   }
 
   setStatus(thread, cx) {
-    if (this.cachedComparison || this.saving) return;
+    if (this.cachedComparison || this.saving || this.clearAttempt) return;
+    const context = this.context(), version = this.contextVersion;
+    const status = thread.status === "resolved" ? "open" : "resolved";
     this.saving = true;
     cx.spawn(async cx => {
-      try { this.wrote(await this.client.setStatus(this.context(), thread.id, thread.status === "resolved" ? "open" : "resolved", newId())); this.refresh(cx, true); }
-      catch (error) { this.error = readableError(error); }
+      try {
+        const result = await this.client.setStatus(context, thread.id, status, newId());
+        if (version !== this.contextVersion || context.reviewId !== this.reviewId) return;
+        if (result.revision >= this.revision) {
+          this.threads = this.threads.map(item => item.id === thread.id ? { ...item, ...result.thread, status } : item);
+          if (status === "resolved" && this.focusThread === thread.id) this.focusThread = null;
+        }
+        this.wrote(result);
+        this.refresh(cx, true);
+      } catch (error) { if (version === this.contextVersion) this.error = readableError(error); }
       finally { this.saving = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // Clearing is deliberate, review-wide, and never runs as part of resolving.
+  // A lost answer retries this exact command; a conflict needs fresh confirmation.
+  clearHistory(cx) {
+    if (this.cachedComparison || this.saving || this.sending || this.leaving || this.viewing || this.postAttempt || !this.reviewId) return;
+    if (this.intent || this.editing) { this.error = "Close the composer or finish editing before clearing history. Saved drafts are kept."; cx.notify(); return; }
+    if (!this.clearAttempt) {
+      this.clearAttempt = { context: this.context(), commandId: newId(), revision: this.revision };
+      cx.notify();
+      return;
+    }
+    const attempt = this.clearAttempt, version = this.contextVersion;
+    if (!attempt.uncertain && attempt.revision !== this.revision) {
+      this.clearAttempt = null;
+      this.error = "The review changed. Check its discussions, then choose Clear history again.";
+      cx.notify();
+      return;
+    }
+    this.saving = true;
+    this.error = null;
+    cx.spawn(async cx => {
+      try {
+        const result = await this.client.clearHistory(attempt.context, attempt.commandId);
+        if (version !== this.contextVersion || this.clearAttempt !== attempt) return;
+        if (result.revision >= this.revision) this.threads = [];
+        this.wrote(result);
+        this.clearAttempt = null;
+        this.focusThread = this.confirmDelete = null;
+        this.expanded.clear();
+        this.comparisons.clear();
+        // Always reload: a replay may predate newly posted discussions.
+        this.refresh(cx, true);
+      } catch (error) {
+        if (version !== this.contextVersion) return;
+        const rejected = ["revision_conflict", "review_conflict", "idempotency_conflict", "invalid_request", "remote_helper_outdated"].includes(error.code);
+        if (rejected) this.clearAttempt = null;
+        else attempt.uncertain = true;
+        this.error = `${readableError(error)}${rejected ? " Check the review before confirming again." : " Clearing may have succeeded. Retry the same clear request to check its outcome."}`;
+        this.refresh(cx, true);
+      } finally { this.saving = false; cx.notify(); }
     });
     cx.notify();
   }
@@ -1183,7 +1257,7 @@ export default class Codewalker extends View {
     const t = theme(), compact = this.width < COMPACT_W;
     const count = filter => discussionGroups(this.threads, this.files, filter).reduce((sum, group) => sum + group.threads.length, 0);
     const groups = discussionGroups(this.threads, this.files, this.filter);
-    const filters = [["all", "All"], ["open", "Open"], ["awaiting", compact ? "Awaiting" : "Awaiting reply"]];
+    const filters = [["active", "Active"], ["all", "All"], ["awaiting", compact ? "Awaiting" : "Awaiting reply"]];
     const items = [];
     for (const group of groups) {
       const { name, dir } = splitPath(group.path), status = group.file?.status;
@@ -1199,25 +1273,35 @@ export default class Codewalker extends View {
       for (const thread of group.threads) items.push(this.discussionItem(thread));
     }
     return v_flex().flex_1().min_h(0).min_w(0)
-      .child(h_flex().h(40).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+      .child(h_flex().min_h(40).flex_wrap().flex_none().px(14).py(7).gap(8).items_center().border_b(1).border_color(t.border)
         .child(h_flex().flex_none().h(26).p(2).gap(2).items_center().rounded(7).bg(t.background).border_1().border_color(t.border)
           .children(filters.map(([filter, label]) => {
             const on = this.filter === filter;
             return Button.new(`filter-${filter}`).h(20).px(8).rounded(5).text_size(12).bg(on ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
               .cursor_pointer().hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground)).accessibility_label(`Show ${label.toLowerCase()} discussions`)
-              .on_mouse_down("left", stop).on_click((_event, cx) => { this.filter = filter; cx.notify(); })
+              .on_mouse_down("left", stop).on_click((_event, cx) => this.setDiscussionFilter(filter, cx))
               .child(h_flex().gap(5).items_center().child(label).child(div().text_size(11).text_color(t.dim).child(String(count(filter)))));
           })))
-        .child(div().flex_1()))
+        .child(div().flex_1())
+        .when(this.filter === "all" && this.threads.length > 0 && !this.clearAttempt, el => el.child(this.button("clear-history", "Clear history", cx => this.clearHistory(cx),
+          { small: true, icon: ICON.trash, enabled: !this.cachedComparison && !this.saving && !this.sending && !this.postAttempt && !this.intent && !this.editing }))))
+      .when(Boolean(this.clearAttempt), el => el.child(v_flex().flex_none().px(14).py(10).gap(8).border_b(1).border_color(t.border)
+        .child(div().text_size(12).text_color(t.muted).child(this.clearAttempt?.uncertain
+          ? "Clearing may have succeeded. Retry to recover the original result, not to delete newer discussions."
+          : "Delete every discussion in this checkout and branch, across all comparison scopes? This cannot be undone. Drafts and viewed marks are kept."))
+        .child(h_flex().gap(8).items_center()
+          .child(this.button("cancel-clear-history", "Cancel", cx => { this.clearAttempt = null; cx.notify(); }, { small: true, enabled: !this.saving }))
+          .child(this.button("confirm-clear-history", this.saving ? "Clearing…" : this.clearAttempt?.uncertain ? "Retry clear" : "Delete discussions", cx => this.clearHistory(cx),
+            { small: true, danger: true, icon: ICON.trash, enabled: !this.saving })))))
       .child(v_flex().id("review-discussions").flex_1().min_h(0).overflow_y_scrollbar().pb(16).children(items)
         .when(!items.length, el => el.child(this.threads.length
-          ? this.emptyState(this.filter === "open" ? "No open discussions" : "No discussions awaiting a reply", "Choose All to see every discussion.")
+          ? this.emptyState(this.filter === "awaiting" ? "No discussions awaiting a reply" : "No active discussions", "Choose All to see resolved discussions and files no longer in this diff.")
           : this.emptyState("No discussions yet", "Drag across line numbers in a diff to start one."))));
   }
 
   sendView() {
     const t = theme(), list = this.candidates(), target = this.target(list), unclear = uncertainCount(this.threads);
-    const items = sendable(this.threads, { again: this.sendAgain });
+    const items = sendable(this.visibleThreads(), { again: this.sendAgain });
     const helper = this.client.helperPath(this.context());
     const text = items.length && helper ? sendText({ items, root: this.root, branch: this.branch, helper, note: this.sendNote.value() }) : "";
     const bytes = utf8Bytes(text), ready = Boolean(target) && Boolean(helper) && READY.has(target.status);
@@ -1269,7 +1353,7 @@ export default class Codewalker extends View {
 
   // Toolbar Send: shown while there is something new (or unclear) to send, and in the Send view.
   sendButton() {
-    const count = sendable(this.threads).length, on = this.mode === "send";
+    const count = sendable(this.visibleThreads()).length, on = this.mode === "send";
     return this.button("open-send", this.width < COMPACT_W ? "" : count ? `Send ${count}` : "Unconfirmed", cx => { if (on) { this.mode = this.backMode ?? "files"; cx.notify(); } else this.openSend(cx); },
       { primary: count > 0 && !on, selected: on, icon: ICON.send, label: "Send to agent", tooltip: on ? "Back" : count ? `Send ${count} new ${count === 1 ? "discussion" : "discussions"} to an agent` : "A send has no confirmation; check the agent" });
   }
@@ -1427,7 +1511,9 @@ export default class Codewalker extends View {
       : expansion?.mode === "max" ? `Widen to the layout's maximum (${expansion.max}px)` : "Expand to fill the workspace";
     const sideW = width >= 1000 ? 280 : 240, diffW = wide ? width - sideW : width, num = compact ? 34 : 46;
     this.cols = { num, inset: compact ? 12 : num * 2 + MARK_W, edge: compact ? 10 : 16 };
-    const currentThreads = this.threads.filter(thread => thread.path === this.file);
+    const shownThreads = this.visibleThreads();
+    const currentThreads = this.threads.filter(thread => thread.path === this.file && (shownThreads.includes(thread)
+      || thread.id === this.focusThread || thread.id === this.intent?.threadId || thread.messages.some(message => message.id === this.editing?.id)));
     const visible = pageRows(this.rows, this.page, PAGE_ROWS, this.from), rendered = new Set(), live = this.canAnchor(), marked = this.marking();
     const content = [];
     for (let i = 0; i < visible.rows.length; i++) {
@@ -1457,24 +1543,26 @@ export default class Codewalker extends View {
 
     const selected = this.pendingFile ?? this.file;
     const changed = new Set(this.files.map(file => file.path));
-    const threadsAt = path => this.threads.filter(thread => thread.path === path);
+    const threadsAt = path => shownThreads.filter(thread => thread.path === path);
     const openAt = path => threadsAt(path).some(thread => thread.status !== "resolved");
-    const retainedPaths = [...new Set(this.threads.map(thread => thread.path).filter(path => !changed.has(path)))];
+    const retainedPaths = [...new Set(shownThreads.map(thread => thread.path).filter(path => !changed.has(path)))];
+    const hiddenCount = this.threads.length - shownThreads.length;
     // Side by side, a 240px list has no room for line counts; stacked, it spans the panel.
     const counts = !wide || width >= 1000;
     const shownFiles = this.visibleFiles(), viewedCount = this.files.filter(file => file.viewed).length;
     const pathItems = shownFiles.map(file => this.pathRow(`file-${file.path}`, file.path, { status: file.status, viewed: file.viewed, selected: selected === file.path, threads: threadsAt(file.path).length, open: openAt(file.path), additions: counts ? file.additions : 0, deletions: counts ? file.deletions : 0 }, cx => this.pickFile(file.path, cx)));
     const totals = this.files.reduce((sum, file) => ({ add: sum.add + (file.additions ?? 0), del: sum.del + (file.deletions ?? 0) }), { add: 0, del: 0 });
     const current = this.files.find(file => file.path === selected);
-    const openCount = this.threads.filter(thread => thread.status !== "resolved").length, draftCount = this.drafts?.length ?? 0;
-    const awaiting = this.threads.filter(thread => thread.awaitingReply).length;
+    const openCount = shownThreads.filter(thread => thread.status !== "resolved").length, draftCount = this.drafts?.length ?? 0;
+    const awaiting = shownThreads.filter(thread => thread.awaitingReply).length;
 
     const root = this.root ?? this.folder;
     const { name: fileName, dir: fileDir } = splitPath(selected ?? "");
     const pickingBase = this.source === "branch" || this.pickBase;
     const baseText = this.baseInput.value().trim(), commitText = this.commitInput.value().trim();
     // Stacked: the file list takes what its rows need, at most about a third of the height.
-    const listRows = Math.max(1, shownFiles.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0);
+    const historyControl = hiddenCount > 0 || (this.filter === "all" && this.threads.length > 0);
+    const listRows = Math.max(1, shownFiles.length + retainedPaths.length + draftCount) + (retainedPaths.length ? 1.25 : 0) + (draftCount ? 1.25 : 0) + (historyControl ? 1 : 0);
     const listH = Math.round(Math.min(78 + listRows * 29, Math.max(120, this.height * 0.34)));
 
     const navigator = v_flex().flex_none().min_h(0).border_color(t.border)
@@ -1490,6 +1578,13 @@ export default class Codewalker extends View {
         .child(div().flex_1().text_size(11).text_color(t.muted).child(`${viewedCount} of ${this.files.length} viewed`))
         .child(this.button("hide-viewed", this.hideViewed ? "Show all" : "Hide viewed", cx => { this.hideViewed = !this.hideViewed; cx.notify(); },
           { small: true, selected: this.hideViewed, label: this.hideViewed ? "Show all changed files" : "Hide viewed files" }))))
+      .when(historyControl, el => el.child(h_flex().min_h(30).flex_none().px(14).py(4).gap(6).items_center()
+        .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).child(this.filter === "all" ? "History shown" : `${hiddenCount} hidden ${hiddenCount === 1 ? "discussion" : "discussions"}`))
+        .child(this.button(this.filter === "all" ? "hide-history" : "show-history", this.filter === "all" ? "Hide history" : "Show history", cx => {
+          const filter = this.filter === "all" ? "active" : "all";
+          if (filter === "all") this.mode = "discussions";
+          this.setDiscussionFilter(filter, cx);
+        }, { small: true }))))
       .child(v_flex().id("review-changed-paths").flex_1().min_h(0).overflow_y_scrollbar().px(6).py(6).gap(1)
         .children(pathItems)
         .when(this.files.length > 0 && !shownFiles.length, el => el.child(div().px(8).py(6).text_size(12).text_color(t.muted).child("All files viewed.")))
@@ -1537,6 +1632,7 @@ export default class Codewalker extends View {
       .on_key_down((event, cx) => {
         if (event.key !== "escape") return;
         if (this.drag) { this.drag = null; cx.notify(); cx.stop_propagation(); }
+        else if (this.clearAttempt && !this.saving) { this.clearAttempt = null; cx.notify(); cx.stop_propagation(); }
         else if (this.confirmDelete) { this.confirmDelete = null; cx.notify(); cx.stop_propagation(); }
         else if (this.editing) { this.cancelEdit(cx); cx.stop_propagation(); }
         else if (this.intent) { this.closeComposer(cx); cx.stop_propagation(); }
@@ -1562,9 +1658,9 @@ export default class Codewalker extends View {
         .child(div().flex_1())
         .child(this.button("refresh", "", cx => this.refresh(cx), { icon: ICON.refresh, tooltip: this.loading ? "Refreshing…" : "Refresh", enabled: !this.loading && !this.saving }))
         .child(this.button("toggle-discussions", !compact && openCount ? String(openCount) : "", cx => { this.mode = this.mode === "discussions" ? "files" : "discussions"; cx.notify(); },
-          { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `All discussions · ${openCount} open` }))
+          { icon: ICON.message, selected: this.mode === "discussions", label: "Discussions", tooltip: this.mode === "discussions" ? "Back to changed files" : `${this.filter === "all" ? "All" : "Active"} discussions · ${openCount} open` }))
         .child(this.button("choose-checkout", "", cx => { this.editRoot = !this.editRoot; if (this.editRoot) this.rootInput.focus(); cx.notify(); }, { icon: ICON.folder, tooltip: `${this.on ? `${this.on}: ` : ""}${root || "No checkout"}${this.branch ? ` (${this.branch})` : ""} · Change folder`, selected: this.editRoot, enabled: !this.saving, label: "Change folder" }))
-        .when(this.mode === "send" || sendable(this.threads).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
+        .when(this.mode === "send" || sendable(this.visibleThreads()).length > 0 || uncertainCount(this.threads) > 0, el => el.child(this.sendButton()))
         .when(Boolean(props()?.overlay), el => el.child(this.button("close-review", "", cx => this.withSavedDraft(cx, cx => closeOverlay(props().overlay)), { icon: ICON.x, tooltip: "Close Review · drafts are kept", enabled: !this.saving })))
         .when(Boolean(expansion?.supported), el => el.child(this.button("expand-review", "", cx => this.toggleExpansion(cx), {
           icon: ICON[expansion.expanded ? "minimize-2" : "maximize-2"], tooltip: expandLabel, selected: expansion.expanded,

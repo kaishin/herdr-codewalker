@@ -300,6 +300,14 @@ export class ReviewClient {
     return this.mutation(context, "delete", { messageId }, commandId);
   }
 
+  async clearHistory(context, commandId) {
+    const helper = await this.helperFor(context);
+    if (helper.machine && !helper.capabilities.includes("history-clear")) throw protocolError({ code: "remote_helper_outdated",
+      message: `The helper on ${helper.machine} cannot clear history. Update it manually: ${this.installCommand(helper.machine)}` });
+    // Pin the revision the person confirmed, not a newer queued mutation's revision.
+    return this.mutation(context, "history-clear", { confirmed: true, expectedRevision: context.revision }, commandId);
+  }
+
   // Delivery record for Send to agent: "uncertain" before, "sent" after, "none" to clear.
   deliver(context, messageIds, state, target, commandId) {
     return this.mutation(context, "deliver", { messageIds, state, target }, commandId);

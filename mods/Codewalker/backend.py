@@ -24,7 +24,7 @@ VERSION = 1
 HELPER_VERSION = 2
 # Optional protocol features a caller may use only when `hello` lists them.
 # "data-parts": repeated --data entries are joined into one mutation JSON.
-CAPABILITIES = ("data-parts",)
+CAPABILITIES = ("data-parts", "history-clear")
 # Store schema; 2 adds messages.reply_requested, 3 adds messages.edited_at and
 # message_edits (earlier bodies), 4 adds deliveries (what was sent to an agent).
 # 5 adds file_views (explicit, per-comparison viewed-file marks).
@@ -655,7 +655,7 @@ class Store:
         allowed = {"commandId", "reviewId", "expectedRevision", "actor"} | {
             "create": {"scope", "base", "commit", "anchor", "body", "replyRequested"}, "reply": {"threadId", "body", "replyRequested"},
             "resolve": {"threadId", "resolved"}, "edit": {"messageId", "body"}, "delete": {"messageId"}, "deliver": {"messageIds", "state", "target"}, "draft-save": {"draftId", "body", "target"},
-            "draft-delete": {"draftId"},
+            "draft-delete": {"draftId"}, "history-clear": {"confirmed"},
             "file-view": {"scope", "base", "commit", "path", "diffFingerprint", "viewed"}}[operation]
         if set(data) - allowed:
             fail("invalid_request", "unknown mutation fields", fields=sorted(set(data) - allowed))
@@ -665,6 +665,8 @@ class Store:
             fail("review_conflict", "worktree or branch changed; reload the pinned review", expectedReviewId=review_id, currentReviewId=self.git.review_id)
         expected = positive(data.get("expectedRevision"), "expectedRevision", minimum=0)
         actor = actor_data(data.get("actor"))
+        if operation == "history-clear" and (actor["kind"] != "human" or data.get("confirmed") is not True):
+            fail("invalid_request", "clearing history requires a human actor and confirmed:true")
         requested = data.get("replyRequested", False)
         if type(requested) is not bool:
             fail("invalid_request", "replyRequested must be true or false")
@@ -757,6 +759,16 @@ class Store:
                     else:
                         self.db.execute("INSERT OR REPLACE INTO deliveries VALUES(?,?,?,?)", (message_id, state, target, timestamp))
                 result["delivered"] = {"messageIds": ids, "state": state}
+            elif operation == "history-clear":
+                # Explicitly clear this review only. Keep drafts, viewed marks and
+                # command receipts so retries cannot delete later discussions.
+                count = self.db.execute("SELECT count(*) FROM threads WHERE review_id=?", (self.git.review_id,)).fetchone()[0]
+                messages = "SELECT m.id FROM messages m JOIN threads t ON t.id=m.thread_id WHERE t.review_id=?"
+                for table in ("message_edits", "deliveries"):
+                    self.db.execute(f"DELETE FROM {table} WHERE message_id IN ({messages})", (self.git.review_id,))
+                self.db.execute("DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE review_id=?)", (self.git.review_id,))
+                self.db.execute("DELETE FROM threads WHERE review_id=?", (self.git.review_id,))
+                result["cleared"] = {"threads": count}
             elif operation == "delete":
                 message = self.own_message(data, actor)
                 thread_id = message["thread_id"]
@@ -1026,7 +1038,7 @@ def parse_args(argv):
     parser = Parser(description=__doc__)
     parser.add_argument("--repo")
     parser.add_argument("--store")
-    parser.add_argument("command", choices=["hello", "skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete"])
+    parser.add_argument("command", choices=["hello", "skill", "open", "context", "review", "list", "create", "reply", "resolve", "edit", "delete", "deliver", "file-view", "export", "draft-save", "draft-delete", "history-clear"])
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--scope", default="uncommitted", choices=["uncommitted", "branch", "commit"])
     parser.add_argument("--base")

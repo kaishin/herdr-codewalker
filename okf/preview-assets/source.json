@@ -1,7 +1,7 @@
 {
   "renderer": "herdr-app shot; actual Codewalker native view",
   "fixture": "okf/preview-assets/fixture.js",
-  "fixtureSha256": "3de176e581d95f38d7d23abd291905d9a08e74031cae7031509931e09d9b10ae",
+  "fixtureSha256": "f27c29e05df2c9737acd35bfdbd26e0a7db7f5c3572872be1ad09e78e73231e3",
   "view": "mods/Codewalker/main.js",
   "viewSha256": "76e614afc1e0f01ea5ab1f8986cc8ddc5364f5f82e15466232f33ebc37c52474",
   "viewCommit": "1cd74149f5625088828b382de10b05dc8367e228",

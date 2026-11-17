@@ -3,10 +3,12 @@ type: Protocol
 title: "Codewalker local CLI protocol v1"
 description: "JSON CLI contracts for review reads, durable mutations, storage, and remote execution."
 tags: ["cli", "storage", "remote", "contracts"]
-generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T22:57:55Z" }
 sources:
   - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/protocol.md"
     title: "Original protocol.md before OKF migration"
+  - resource: "Repository worktree: mods/Codewalker/main.js, model.js, client.js, and backend.py"
+    title: "Active discussion visibility and confirmed history clearing"
 ---
 # Codewalker local CLI protocol v1
 
@@ -32,7 +34,7 @@ Exactly one stdout JSON value per invocation:
 
 Needs no `--repo` and never opens a store or repository. Returns `{helper, helperVersion, capabilities, python, platform, git, home, storePath}`: the helper's absolute path on its machine, its build number (2 or newer has `hello`), optional protocol features, the Python version, the Git executable or null, and the default store path. A caller on another machine uses it to find a compatible helper before any other command. A helper without `hello` answers `invalid_request`; treat that as outdated, not as missing.
 
-`capabilities` lists optional features a caller may use only when present. `data-parts`: `--data` can be repeated and the entries are joined, in order, into one mutation JSON (still at most 1 MiB). A helper without it uses only the last entry, so never repeat `--data` for it.
+`capabilities` lists optional features a caller may use only when present. `history-clear` supports the human-confirmed, review-wide deletion command below. A remote helper without it must be updated manually before the UI can clear history. `data-parts`: `--data` can be repeated and the entries are joined, in order, into one mutation JSON (still at most 1 MiB). A helper without it uses only the last entry, so never repeat `--data` for it.
 
 ### `context`
 
@@ -103,12 +105,17 @@ Serialize/coalesce native draft writes and thread mutations in one GUI write que
 | `create` | `scope`, optional `base` (branch) or required `commit` (commit scope), `anchor:{path,side,startLine,endLine,snapshotId}`, `body`, optional `replyRequested:true|false` | `{reviewId,revision,thread}` |
 | `reply` | `threadId`, `body`, optional `replyRequested:true|false` | `{reviewId,revision,thread}` |
 | `resolve` | `threadId`, `resolved:true|false` (explicit set, not toggle) | `{reviewId,revision,thread}` |
+| `history-clear` | `confirmed:true`, human actor only | `{reviewId,revision,cleared:{threads:<count>}}` |
 | `edit` | `messageId`, `body` | `{reviewId,revision,thread}` |
 | `delete` | `messageId` | `{reviewId,revision,deleted:{messageId,threadId,thread},thread?}` |
 | `deliver` | `messageIds` (1–1000 distinct), `state:"uncertain"|"sent"|"none"`, optional `target` (terminal address) | `{reviewId,revision,delivered:{messageIds,state}}` |
 | `file-view` | `scope`, optional `base` (branch) or required `commit` (commit scope), `path`, `diffFingerprint`, `viewed:true|false` | `{reviewId,revision,fileView:{path,diffFingerprint,viewed,scope,baseRef,commitOid?}}` |
 | `draft-save` | `draftId` (caller-chosen stable ID), `body`, `target` (JSON object: e.g. threadId or creation anchor/scope/base) | `{reviewId,revision,draft}` |
 | `draft-delete` | `draftId` | `{reviewId,revision,draftId}` |
+
+`history-clear` requires `actor.kind:"human"` and literal `confirmed:true`. It atomically deletes all threads, messages, edit history, and delivery records for the pinned worktree/branch review, across every comparison scope and author. Drafts, viewed marks, other reviews, and idempotency receipts are retained. The UI confirms the revision the person saw; it does not silently adopt a newer revision from queued writes. Conflicts need fresh confirmation. Retrying the same command returns its original result and cannot delete discussions posted later. This is not secure erasure: retained command receipts can contain earlier discussion text. Actor metadata remains trusted-user attribution, not authentication.
+
+The native UI hides resolved and out-of-diff threads by default; `review`, `list`, and `export` still return all discussions. Resolution and disappearance from a diff never trigger deletion.
 
 `file-view` sets a mark, never toggles blindly. Both marking and unmarking compare `diffFingerprint` with fresh file evidence; mismatches fail `snapshot_conflict`, absent paths fail `not_found`, and unavailable fingerprints fail `invalid_request`. Unrelated file changes do not reject a mark. These mutations share the write queue, optimistic revision and idempotency receipts with discussions. Marks are a shared local checklist keyed by review identity, scope, resolved base-ref **name** and path (not actor). Different base-ref names have separate checklists. Commit scope instead keys by the resolved full commit SHA; aliases of that SHA share marks, distinct commits do not. Stale marks remain stored but do not count; returning to exactly the marked file version restores the mark. Reads never prune or write marks. No forge writes occur.
 

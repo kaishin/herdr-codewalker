@@ -3,10 +3,12 @@ type: Playbook
 title: "Agent workflow"
 description: "Use the shared CLI to read diffs, exchange review comments, and recover safely from conflicts."
 tags: ["agents", "review", "cli"]
-generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T22:57:55Z" }
 sources:
   - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/agent-workflow.md"
     title: "Original agent-workflow.md before OKF migration"
+  - resource: "Repository worktree: mods/Codewalker/main.js, model.js, client.js, and backend.py"
+    title: "Active discussion visibility and confirmed history clearing"
 ---
 # Agent workflow
 
@@ -144,6 +146,10 @@ PY
 ```
 
 Export is nonconsuming; it never clears notes or sends/submits agent input.
+
+## Conversation visibility
+
+Native Review defaults to **Active**: unresolved discussions on changed files. Resolved conversations and files no longer in the diff are hidden, not deleted; **Show history** or **Discussions → All** recovers them. Changed anchors on still-changed files remain visible. The CLI continues returning every thread, including historical ones. Do not treat disappearance from the active UI as deletion, and do not clear history on the reviewer's behalf unless explicitly asked. Review-wide clearing is a separate human-confirmed operation documented in the [protocol](/protocol.md).
 
 ## Viewed-file checklist
 

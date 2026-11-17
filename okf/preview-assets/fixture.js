@@ -13,6 +13,7 @@ export default class Preview extends Codewalker {
   discard() {}
   saveEdit() {}
   deleteMessage() {}
+  clearHistory() {}
   setStatus() {}
   setViewed() {}
   send() {}

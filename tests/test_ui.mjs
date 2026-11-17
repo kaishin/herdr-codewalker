@@ -278,6 +278,7 @@ test("Send reaches only an agent on the checkout's machine and names that machin
       deliver: async (context, _ids, state, target) => { calls.deliver.push([context.on, state, target]); return { reviewId: "review-a", revision: 9, machine: context.on }; } } });
   view.intent = null;
   view.on = "vps";
+  view.files = [{ path: "a.txt" }];
   view.threads = [unsentThread()];
   assert.deepEqual(view.candidates().map(a => a.address), ["vps/t7"], "the focused local agent at the same path is not offered");
   view.sendTarget = "t7";
@@ -679,15 +680,16 @@ const twoHunks = () => [
 ];
 const thread = (id, path, line, extra = {}) => ({ id, path, status: "open", anchor: { side: "new", startLine: line, endLine: line }, messages: [], ...extra });
 
-test("discussions group by file in diff order, then files no longer in the diff, by line, and filter", async () => {
+test("active discussions hide resolved and absent files, keep outdated anchors, and All restores history in diff order", async () => {
   const { load } = await modules();
   const model = await load(path.join(root, "mods/Codewalker/model.js"));
   const files = [{ path: "b.txt" }, { path: "a.txt" }];
-  const threads = [thread("t1", "gone.txt", 3), thread("t2", "a.txt", 9, { awaitingReply: true }), thread("t3", "b.txt", 5, { status: "resolved" }), thread("t4", "a.txt", 2)];
+  const threads = [thread("t1", "gone.txt", 3, { awaitingReply: true }), thread("t2", "a.txt", 9, { awaitingReply: true }), thread("t3", "b.txt", 5, { status: "resolved" }), thread("t4", "a.txt", 2), thread("t5", "b.txt", 7, { outdated: true })];
   // The module runs in its own realm; compare plain JSON.
   const ids = filter => JSON.stringify(model.namespace.discussionGroups(threads, files, filter).map(group => [group.path, group.threads.map(item => item.id)]));
-  assert.equal(ids("all"), JSON.stringify([["b.txt", ["t3"]], ["a.txt", ["t4", "t2"]], ["gone.txt", ["t1"]]]));
-  assert.equal(ids("open"), JSON.stringify([["a.txt", ["t4", "t2"]], ["gone.txt", ["t1"]]]));
+  assert.equal(ids(), JSON.stringify([["b.txt", ["t5"]], ["a.txt", ["t4", "t2"]]]));
+  assert.equal(ids("active"), ids());
+  assert.equal(ids("all"), JSON.stringify([["b.txt", ["t3", "t5"]], ["a.txt", ["t4", "t2"]], ["gone.txt", ["t1"]]]));
   assert.equal(ids("awaiting"), JSON.stringify([["a.txt", ["t2"]]]));
 });
 
@@ -804,6 +806,7 @@ async function sendSetup({ hcResult, agentsList, deliverFail } = {}) {
     client: { deliver: async (_context, ids, state, target) => { calls.deliver.push([state, ids.join(","), target]); if (deliverFail) throw new Error(deliverFail); return { reviewId: "review-a", revision: 9 }; } },
   });
   harness.view.intent = null;
+  harness.view.files = [{ path: "a.txt" }];
   harness.view.threads = [unsentThread()];
   return { ...harness, calls };
 }
@@ -823,6 +826,7 @@ test("the send target is the focused agent, else the only one in this checkout; 
 
 test("a send records uncertain, runs plain hc send, then records sent and focuses the agent", async () => {
   const { view, cx, drain, calls } = await sendSetup();
+  view.threads.push(unsentThread({ id: "gone", path: "gone.txt", messages: [{ id: "gone-message", actor: you, body: "Historical question" }] }));
   view.openSend(cx);
   view.send(cx);
   await drain();
@@ -940,7 +944,7 @@ test("a send shows Sending while hc waits, and an answer after the checkout chan
   assert.equal(view.sendNote.value(), "Fix first");
   assert.equal(view.sendNotice, null);
   assert.equal(view.sending, false);
-  Object.assign(view, { root: "/checkout", reviewId: "review-a", threads: [unsentThread()] }); // The next checkout loaded.
+  Object.assign(view, { root: "/checkout", reviewId: "review-a", files: [{ path: "a.txt" }], threads: [unsentThread()] }); // The next checkout loaded.
   view.send(cx);
   await settle();
   assert.equal(calls.hc.length, 2);
@@ -1368,4 +1372,94 @@ test("closing an expanded dock restores the workspace through the view lifecycle
   assert.equal(host.panel.hidden, true, "restoring width must not reopen a closed panel");
   assert.equal(host.panel.size.px, 368);
   assert.equal(Object.keys(host.state.get("workspace.expanded.v1")).length, 0);
+});
+
+test("resolving hides a conversation immediately; reopening or returning files restores it without deleting messages", async () => {
+  let saved = thread("t1", "a.txt", 1, { messages: [{ id: "m1", body: "Keep the rationale" }] });
+  const { view, cx, drain } = await modules({ client: {
+    setStatus: async (_context, _id, status) => ({ reviewId: "review-a", revision: 2, thread: saved = { ...saved, status } }),
+    review: async () => ({ ...review(), files: [{ path: "a.txt" }], threads: [saved] }),
+  } });
+  view.intent = null;
+  view.files = [{ path: "a.txt" }];
+  view.threads = [saved];
+  view.focusThread = saved.id;
+  view.setStatus(saved, cx);
+  await drain();
+  assert.equal(view.visibleThreads().length, 0);
+  assert.equal(view.focusThread, null);
+  assert.equal(view.threads[0].messages[0].body, "Keep the rationale");
+  view.filter = "all";
+  assert.equal(view.visibleThreads()[0].id, saved.id);
+  view.setStatus(view.threads[0], cx);
+  await drain();
+  view.filter = "active";
+  assert.equal(view.visibleThreads().length, 1);
+  view.apply({ ...review(), files: [], threads: [saved] }, {}, cx);
+  assert.equal(view.file, null, "a removed diff is not kept open just for its history");
+  assert.equal(view.visibleThreads().length, 0);
+  view.apply({ ...review(), files: [{ path: "a.txt" }], threads: [saved] }, {}, cx);
+  assert.equal(view.visibleThreads().length, 1);
+});
+
+test("a reply draft survives when its file leaves the diff, but its history stays hidden by default", async () => {
+  const { view, cx } = await modules();
+  const saved = thread("t1", "a.txt", 1);
+  view.threads = [saved];
+  view.intent = { ...view.intent, threadId: saved.id };
+  view.apply({ ...review(), files: [], threads: [saved], detail: { path: "a.txt", rows: [], note: "Not in this diff" } }, { path: "a.txt" }, cx);
+  assert.equal(view.file, "a.txt");
+  assert.equal(view.visibleThreads().length, 0);
+  assert.equal(view.intent.threadId, "t1");
+  assert.equal(view.composer.value(), "Human question");
+});
+
+test("Clear history requires confirmation of an unchanged review and retries an uncertain result without clearing newer discussions", async () => {
+  const calls = [];
+  const newer = thread("new", "a.txt", 1);
+  const { view, cx, drain } = await modules({ client: {
+    clearHistory: async (context, commandId) => {
+      calls.push({ ...context, commandId });
+      if (calls.length === 1) throw new Error("answer lost");
+      return { reviewId: "review-a", revision: 2, cleared: { threads: 1 } };
+    },
+    review: async () => ({ ...review(), revision: 4, files: [{ path: "a.txt" }], threads: [newer] }),
+  } });
+  view.clearHistory(cx);
+  assert.equal(view.clearAttempt, null, "an open composer must be closed first");
+  assert.equal(view.composer.value(), "Human question");
+  view.intent = null;
+  view.clearHistory(cx);
+  assert.equal(calls.length, 0, "the first press only asks");
+  view.revision++;
+  view.clearHistory(cx);
+  assert.equal(view.clearAttempt, null, "a changed review needs fresh confirmation");
+  assert.equal(calls.length, 0);
+  view.revision = 1;
+  view.clearHistory(cx);
+  view.clearHistory(cx);
+  await drain();
+  assert.equal(view.clearAttempt.uncertain, true);
+  assert.equal(view.revision, 4);
+  view.clearHistory(cx);
+  await drain();
+  assert.equal(calls[0].commandId, calls[1].commandId);
+  assert.equal(calls[1].revision, 1, "the confirmation's revision stays pinned");
+  assert.equal(view.clearAttempt, null);
+  assert.equal(view.threads[0].id, "new", "an older replay does not erase newer discussions from the view");
+});
+
+test("clearing pins the confirmed revision and refuses remote helpers without the capability", async () => {
+  const { client } = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", capabilities: ["history-clear"], revision: 7 } });
+  const context = { on: "vps", root: "/checkout", reviewId: "review-a", revision: 3 };
+  await client.review(context);
+  const requests = [];
+  const call = client.call.bind(client);
+  client.call = (context, command, args) => { if (command === "history-clear") requests.push(JSON.parse(args[1])); return call(context, command, args); };
+  await client.clearHistory(context, "clear-once");
+  assert.equal(requests[0].expectedRevision, 3, "do not silently adopt a newer background read's revision");
+  assert.equal(requests[0].confirmed, true);
+  const old = await remoteClient({ vps: { helper: "/home/vps/.local/share/herdr-codewalker/backend.py", revision: 7 } });
+  await assert.rejects(old.client.clearHistory(context, "no-clear"), error => error.code === "remote_helper_outdated");
+  assert.equal(old.calls.some(call => call.args.includes("history-clear")), false);
 });
