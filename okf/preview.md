@@ -1,3 +1,13 @@
+---
+type: Playbook
+title: "Gallery preview"
+description: "Rebuild and safely capture the synthetic native preview and distribution artwork."
+tags: ["distribution", "preview", "privacy"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/preview.md"
+    title: "Original preview.md before OKF migration"
+---
 # Gallery preview
 
 `../preview.png` is a 2560×1280 composition based on the user's reference: marketing title/subtitle on the left and the most useful native UI on the right. Codewalker shows a commit diff, viewed checklist, and inline human–agent conversation. The background has blue/purple tints and a notebook-style dot grid; the native screenshot keeps its original colors. Text and artwork render at 2× resolution, not by enlarging the previous PNG.

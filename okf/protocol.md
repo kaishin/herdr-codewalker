@@ -1,6 +1,16 @@
+---
+type: Protocol
+title: "Codewalker local CLI protocol v1"
+description: "JSON CLI contracts for review reads, durable mutations, storage, and remote execution."
+tags: ["cli", "storage", "remote", "contracts"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/protocol.md"
+    title: "Original protocol.md before OKF migration"
+---
 # Codewalker local CLI protocol v1
 
-Implementation owner: backend worker; files `mods/Codewalker/backend.py`, `tests/test_backend.py`, `pyproject.toml`, `docs/protocol.md`. Native UI owns its own adapter. Python 3 stdlib only, SQLite transactions, no daemon/network. This document is the implementation contract.
+Implementation owner: backend worker; files `mods/Codewalker/backend.py`, `tests/test_backend.py`, `pyproject.toml`, `okf/protocol.md`. Native UI owns its own adapter. Python 3 stdlib only, SQLite transactions, no daemon/network. This document is the implementation contract.
 
 ## Invocation and envelope
 

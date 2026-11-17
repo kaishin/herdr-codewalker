@@ -91,7 +91,7 @@ python3 ~/.config/herdr-app/mods/Codewalker/backend.py open \
   --repo /absolute/local/checkout --scope commit --commit HEAD~1
 ```
 
-`open` validates and resolves the commit before opening a pane, passes its full SHA, and returns the **new** pane ID, folder, scope and `commitOid`. To get data without opening UI, use `review --scope commit --commit <ref> --json`. See [`docs/protocol.md`](docs/protocol.md).
+`open` validates and resolves the commit before opening a pane, passes its full SHA, and returns the **new** pane ID, folder, scope and `commitOid`. To get data without opening UI, use `review --scope commit --commit <ref> --json`. See [`okf/protocol.md`](okf/protocol.md).
 
 ### Review in the side panel (your own layout)
 
@@ -187,7 +187,9 @@ Limits: no remote folder watch (see Review flow, step 7). `backend.py open` work
 
 ## Agents use the same store and CLI
 
-See [`docs/agent-workflow.md`](docs/agent-workflow.md) for copyable agent commands and [`docs/protocol.md`](docs/protocol.md) for the exact JSON contract, optimistic revision checks, actor attribution, limits, and recovery rules. Native behavior and the pending manual checklist are in [`docs/ux.md`](docs/ux.md).
+The [OKF knowledge bundle](okf/index.md) indexes project documentation, verification notes, and proposals.
+
+See [`okf/agent-workflow.md`](okf/agent-workflow.md) for copyable agent commands and [`okf/protocol.md`](okf/protocol.md) for the exact JSON contract, optimistic revision checks, actor attribution, limits, and recovery rules. Native behavior and the pending manual checklist are in [`okf/ux.md`](okf/ux.md).
 
 ```sh
 python3 /absolute/herdr-codewalker/mods/Codewalker/backend.py \
@@ -218,7 +220,7 @@ The UI tests exercise async draft/navigation/post state, and remote routing with
 
 ## Distribution assets
 
-[RECIPE.md](RECIPE.md) describes the shipped behavior and rebuild requirements. [Preview documentation](docs/preview.md) records the synthetic native screenshot, composition, and reproduction commands. The preview uses demo data, not a private checkout or agent transcript.
+[RECIPE.md](RECIPE.md) describes the shipped behavior and rebuild requirements. [Preview documentation](okf/preview.md) records the synthetic native screenshot, composition, and reproduction commands. The preview uses demo data, not a private checkout or agent transcript.
 
 Publication requires a public GitHub repository containing this package and the `herdr-mod` topic. Herdr's guide says eligible packages appear in the [community gallery](https://herdr.dev/mods/) within the hour; indexing is not guaranteed. Verify the live catalog after publication.
 
@@ -226,4 +228,4 @@ Publication requires a public GitHub repository containing this package and the 
 
 Codewalker is [MIT licensed](LICENSE), copyright © 2026 Reda Lemeden. The self-contained mod folder includes a copy of the license.
 
-Third-party assets retain their own terms: [Lucide/Feather icons](mods/Codewalker/icons/LICENSE) use ISC/MIT; the Inter font used only for preview artwork uses [SIL OFL 1.1](docs/preview-assets/INTER-LICENSE.txt).
+Third-party assets retain their own terms: [Lucide/Feather icons](mods/Codewalker/icons/LICENSE) use ISC/MIT; the Inter font used only for preview artwork uses [SIL OFL 1.1](okf/preview-assets/INTER-LICENSE.txt).

@@ -15,7 +15,7 @@ import tempfile
 from install import no_symlink_ancestors, regular_tree
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT / "docs/preview-assets"
+ASSETS = ROOT / "okf/preview-assets"
 NAME = "Codewalker-Distribution-Preview"
 HOME = Path(os.environ.get("HERDR_APP_HOME", Path.home() / ".config/herdr-app")).expanduser().absolute()
 DESTINATION = HOME / "mods" / NAME

@@ -1,3 +1,13 @@
+---
+type: Reference
+title: "Review surface"
+description: "Native review structure, interaction rules, responsiveness, and pending manual checks."
+tags: ["ui", "review", "verification"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/ux.md"
+    title: "Original ux.md before OKF migration"
+---
 # Review surface
 
 **Mode: Operate.** Extend the established Herdr interface. Do not introduce a web-style visual identity. Visual authority: shipped `tabs`, `changes`, `workspace-chrome` and theme tokens; a baseline screenshot was captured and inspected during research.

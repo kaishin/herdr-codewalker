@@ -946,8 +946,8 @@ Deleting the first message of a thread deletes the whole thread.
 - `invalid_request` on edit or delete: the message is not yours, or the ID is wrong.
 - `storage_error`: stop and tell the reviewer. Do not delete or recreate the store.
 
-To start a thread yourself, or for all fields and errors, see docs/agent-workflow.md
-and docs/protocol.md in the herdr-codewalker repository.
+To start a thread yourself, or for all fields and errors, see okf/agent-workflow.md
+and okf/protocol.md in the herdr-codewalker repository.
 """
 
 

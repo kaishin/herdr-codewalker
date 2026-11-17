@@ -1,3 +1,13 @@
+---
+type: Playbook
+title: "Agent workflow"
+description: "Use the shared CLI to read diffs, exchange review comments, and recover safely from conflicts."
+tags: ["agents", "review", "cli"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/agent-workflow.md"
+    title: "Original agent-workflow.md before OKF migration"
+---
 # Agent workflow
 
 Codewalker is a local Python 3 CLI shared with the native Herdr review mod. No Pi extension, daemon, MCP server, browser, or chat scraping is needed. Commands read Git; only the separate annotation database is written. They do not stage files, submit chat, or post PR comments.
@@ -147,7 +157,7 @@ When asked, use `file-view` with the common mutation envelope and `{scope, base,
 
 ## Show Review to the reviewer
 
-`python3 "$CW" open` in a local Herdr terminal opens Review as a pane right of that terminal, for its folder (or `--repo`). Add `--scope commit --commit <SHA-or-ref>` to open a specific commit, or `--scope branch --base <ref>` for branch mode. The returned `pane` is the newly created pane. Other mods use `pane.split` with `props:{framed:true, folder, scope:"commit", commit}`; see the public props contract in [protocol.md](protocol.md).
+`python3 "$CW" open` in a local Herdr terminal opens Review as a pane right of that terminal, for its folder (or `--repo`). Add `--scope commit --commit <SHA-or-ref>` to open a specific commit, or `--scope branch --base <ref>` for branch mode. The returned `pane` is the newly created pane. Other mods use `pane.split` with `props:{framed:true, folder, scope:"commit", commit}`; see the public props contract in [protocol.md](/protocol.md).
 
 ## Conflicts and uncertain outcomes
 
@@ -184,4 +194,4 @@ os.chmod(sys.argv[2], 0o600)
 PY
 ```
 
-The database can contain reviews for several checkouts and private source snippets. Keep backups and saved request JSON private; never commit them. See [protocol.md](protocol.md) for complete field/error/limit contracts and durable draft commands.
+The database can contain reviews for several checkouts and private source snippets. Keep backups and saved request JSON private; never commit them. See [protocol.md](/protocol.md) for complete field/error/limit contracts and durable draft commands.

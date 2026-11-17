@@ -1,3 +1,14 @@
+---
+type: Proposal
+title: "Agent-driven file grouping via JSON"
+description: "Proposed opt-in review groups supplied by external agents through the existing integration."
+tags: ["agents", "grouping", "proposal"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/agent-file-grouping-plan.md"
+    title: "Original agent-file-grouping-plan.md before OKF migration"
+status: draft
+---
 # Codewalker: Agent-driven file grouping via JSON
 
 Status: proposal, not implemented. The example schema is illustrative, not a finalized contract.
@@ -52,7 +63,7 @@ Illustrative schema, not a finalized contract:
 
 ## Existing integration
 
-The current [agent workflow](agent-workflow.md) and [CLI protocol](protocol.md) document the shared comments/replies integration and persistent review store. Grouping submission and the **Generate Groups** button described here are proposed extensions, not existing protocol features.
+The current [agent workflow](/agent-workflow.md) and [CLI protocol](/protocol.md) document the shared comments/replies integration and persistent review store. Grouping submission and the **Generate Groups** button described here are proposed extensions, not existing protocol features.
 
 ## Longer-term vision
 

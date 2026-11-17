@@ -1,8 +1,18 @@
+---
+type: Verification Report
+title: "Remote support implementation and verification"
+description: "Historical implementation results, accepted Send trade-offs, and remaining remote verification limits."
+tags: ["remote", "delivery", "verification"]
+generated: { by: "pi/gpt-6.1-sol", at: "2026-11-17T00:04:58Z" }
+sources:
+  - resource: "Git revision febd5e0a69ca81d65d9ea3c0f593af824532c7d1, file docs/remote-support-report.md"
+    title: "Original remote-support-report.md before OKF migration"
+---
 # Remote support: implementation and verification
 
 Implementation and verification notes from 2026-11-14. Machine names, private repository paths, conversation excerpts, and deployment receipts are omitted. The live checks below are historical results, not a claim that they ran on every later revision.
 
-For setup and current behavior, see [README.md](../README.md), [protocol.md](protocol.md), and [ux.md](ux.md).
+For setup and current behavior, see [README.md](../README.md), [protocol.md](/protocol.md), and [ux.md](/ux.md).
 
 ## Remote reviews
 
